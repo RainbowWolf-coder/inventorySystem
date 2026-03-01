@@ -1,0 +1,120 @@
+{
+  "functions": {
+    "source": "functions"
+  },
+  "firestore": {
+    "rules": "firestore.rules",
+    "indexes": "firestore.indexes.json"
+  },
+  "hosting": {
+    "public": "public",
+    "ignore": [
+      "firebase.json",
+      "index.html",
+      "**/.*",
+      "**/node_modules/**"
+    ],
+    "redirects": [
+      {
+        "source": "/",
+        "destination": "/inventoryData.html",
+        "type": 302
+      },
+      {
+        "source": "/index.html",
+        "destination": "/inventoryData.html",
+        "type": 302
+      }
+    ],
+    "rewrites": [
+      {
+        "source": "/api/recordData",
+        "function": "recordData"
+      },
+      {
+        "source": "/api/lookups",
+        "function": "lookups"
+      },
+      {
+        "source": "/api/withdrawals",
+        "function": "withdrawals"
+      },
+      {
+        "source": "/api/withdrawalStats",
+        "function": "withdrawalStats"
+      },
+      {
+        "source": "/api/names",
+        "function": "names"
+      },
+      {
+        "source": "/api/items",
+        "function": "items"
+      },
+      {
+        "source": "/api/addStock",
+        "function": "addStock"
+      },
+      {
+        "source": "/api/removeStock",
+        "function": "removeStock"
+      },
+      {
+        "source": "/api/processStockAdjustments",
+        "function": "processStockAdjustmentsHttp"
+      },
+      {
+        "source": "/api/recieveForm",
+        "function": "recieveForm"
+      },
+      {
+        "source": "/api/sendMonthlyWithdrawalsReport",
+        "function": "sendMonthlyWithdrawalsReport"
+      },
+      {
+        "source": "/api/outOfStock",
+        "function": "outOfStock"
+      },
+      {
+        "source": "/api/telegramTest",
+        "function": "telegramTest"
+      },
+      {
+        "source": "/api/telegramUpdates",
+        "function": "telegramUpdates"
+      },
+      {
+        "source": "/api/telegramChatInfo",
+        "function": "telegramChatInfo"
+      },
+      {
+        "source": "/api/telegramMe",
+        "function": "telegramMe"
+      },
+      {
+        "source": "/api/syncItems",
+        "function": "syncItems"
+      },
+      {
+        "source": "/api/sheetStatus",
+        "function": "sheetStatus"
+      }
+    ]
+  },
+  "emulators": {
+    "functions": {
+      "port": 5001
+    },
+    "firestore": {
+      "port": 8080
+    },
+    "hosting": {
+      "port": 5000
+    },
+    "ui": {
+      "enabled": true,
+      "port": 4000
+    },
+    "singleProjectMode": true
+  }
+}

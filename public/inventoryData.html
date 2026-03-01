@@ -1,0 +1,180 @@
+﻿<!DOCTYPE html>
+<html lang="th">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Store PP2 - ระบบลงทะเบียนเบิกของ</title>
+    
+    <!-- Bootstrap 5 CSS -->
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <!-- SweetAlert2 CSS -->
+    <link href="https://cdn.jsdelivr.net/npm/sweetalert2@11/dist/sweetalert2.min.css" rel="stylesheet">
+    <!-- Google Fonts -->
+    <link href="https://fonts.googleapis.com/css2?family=Kanit:wght@300;400;500;600&display=swap" rel="stylesheet">
+    <!-- Bootstrap Icons -->
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.0/font/bootstrap-icons.css">
+    <link rel="stylesheet" href="/inventoryData.css">
+    
+</head>
+<body>
+    <div class="main-container">
+        <!-- Header -->
+        <div class="header-section">
+            <h1><i class="bi bi-shop-window me-3"></i>ยินดีต้อนรับสู่ Store PP2</h1>
+            <p>กรุณากรอกข้อมูลให้ครบถ้วน</p>
+            <p class="mb-0"><i class="bi bi-search me-2"></i>ช่องรายการสามารถพิมพ์ค้นหาได้</p>
+        </div>
+        
+        <!-- Form Section -->
+        <div class="card card-custom">
+            <div class="card-header card-header-custom">
+                <i class="bi bi-clipboard-plus me-2"></i>แบบฟอร์มลงทะเบียนเบิกของ
+            </div>
+            <div class="card-body p-4">
+                <form id="requestForm">
+                    <!-- ชื่อ -->
+                    <div class="mb-4 form-group">
+                        <label class="form-label">ชื่อ</label>
+                        <div class="input-group">
+                            <span class="input-group-text" style="padding:0">
+                                <button type="button" class="name-dropdown-btn" id="btnNameDropdown" aria-label="ดูรายชื่อ" title="ดูรายชื่อ">
+                                    <i class="bi bi-person"></i>
+                                    <span>ดูรายชื่อ</span>
+                                </button>
+                            </span>
+                            <input type="text" class="form-control" id="inputName" placeholder="← หากเคยกรอกชื่อแล้ว กดปุ่มดูรายชื่อได้เลย" autocomplete="off">
+                        </div>
+
+                        <div id="nameSuggestions" class="list-group shadow name-suggestions" role="listbox" aria-label="รายชื่อ"></div>
+                    </div>
+                    
+                    <!-- รายการ -->
+                    <div class="mb-4 form-group">
+                        <label class="form-label">รายการ</label>
+                        <div class="input-group">
+                            <span class="input-group-text input-group-text-plain" style="padding:0">
+                                <button type="button" class="name-dropdown-btn" id="btnItemDropdown" aria-label="ดูรายการ" title="ดูรายการ">
+                                    <i class="bi bi-box-seam"></i>
+                                    <span>รายการ 📦</span>
+                                </button>
+                            </span>
+                            <input type="text" class="form-control" id="inputItem" placeholder="← พิมพ์ค้นหาหรือกดปุ่มดูรายการ" autocomplete="off">
+                        </div>
+
+                        <div id="itemSuggestions" class="list-group shadow item-suggestions" role="listbox" aria-label="รายการที่ค้นหา"></div>
+                    </div>
+                    
+                    <!-- จำนวน และ หน่วย -->
+                    <div class="row mb-4">
+                        <div class="col-md-6">
+                            <label class="form-label">จำนวน</label>
+                            <input type="number" class="form-control" id="inputQuantity" placeholder="ระบุจำนวน" min="1">
+                        </div>
+                        <div class="col-md-6">
+                            <label class="form-label">หน่วย</label>
+                            <select class="form-select" id="inputUnit">
+                                <option value="ชิ้น">ชิ้น</option>
+                                <option value="กล่อง">กล่อง</option>
+                                <option value="ชุด">ชุด</option>
+                                <option value="ม้วน">ม้วน</option>
+                                <option value="เล่ม">เล่ม</option>
+                                <option value="ขวด">ขวด</option>
+                                <option value="คู่">คู่</option>
+                                <option value="หลอด">หลอด</option>
+                                <option value="แพ็ค">แพ็ค</option>
+                            </select>
+                        </div>
+                    </div>
+                    
+                    <!-- ปุ่ม -->
+                    <div class="d-flex gap-3 justify-content-center mb-4">
+                        <button type="button" class="btn btn-custom btn-add-item" onclick="addItem()">
+                            <i class="bi bi-plus-circle me-2"></i>รายการเบิก
+                        </button>
+                        <button type="button" class="btn btn-custom" onclick="submitForm()">
+                            <i class="bi bi-check-circle me-2"></i>ตกลง
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+        
+        <!-- Out of Stock Table -->
+        <div class="card card-custom">
+            <div class="card-header card-header-custom card-header-danger">
+                <i class="bi bi-exclamation-triangle me-2"></i>รายการที่หมดสต็อก
+            </div>
+            <div class="card-body p-4">
+                <div class="table-responsive">
+                    <table class="table table-custom table-hover">
+                        <thead>
+                            <tr>
+                                <th width="70%">รายการ</th>
+                                <th width="30%">สถานะ</th>
+                            </tr>
+                        </thead>
+                        <tbody id="outOfStockTableBody"></tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Added Items Floating Widget -->
+    <div id="addedItemsWidget" class="position-fixed bottom-0 end-0 p-3" style="display:none;">
+        <button type="button"
+                class="btn btn-light shadow rounded-pill d-flex align-items-center gap-2"
+                data-bs-toggle="offcanvas" data-bs-target="#offcanvasAddedItems"
+                aria-controls="offcanvasAddedItems">
+            <i class="bi bi-list-check" style="font-size: 1.1rem;"></i>
+            <span>
+                เพิ่มแล้ว <span class="fw-semibold" id="addedItemsCount">0</span> รายการ
+                <span class="text-muted ms-2" style="font-size: 0.9rem;">ดูรายละเอียด</span>
+            </span>
+        </button>
+    </div>
+
+    <!-- Added Items Offcanvas (Bootstrap) -->
+    <div class="offcanvas offcanvas-end" tabindex="-1" id="offcanvasAddedItems" aria-labelledby="offcanvasAddedItemsLabel">
+        <div class="offcanvas-header">
+            <h5 class="offcanvas-title" id="offcanvasAddedItemsLabel">
+                <i class="bi bi-clipboard-check me-2"></i>รายการที่เพิ่มไว้
+            </h5>
+            <button type="button" class="btn-close" data-bs-dismiss="offcanvas" aria-label="Close"></button>
+        </div>
+        <div class="offcanvas-body">
+            <div class="d-flex justify-content-between align-items-center mb-3">
+                <div class="text-muted">
+                    รวม <span class="fw-semibold" id="addedItemsCountDetail">0</span> รายการ
+                </div>
+            </div>
+
+            <div class="table-responsive">
+                <table class="table table-sm align-middle">
+                    <thead class="table-light">
+                        <tr>
+                            <th style="width: 56px;">#</th>
+                            <th>รายการ</th>
+                            <th style="width: 120px;" class="text-end">จำนวน</th>
+                            <th style="width: 90px;">หน่วย</th>
+                            <th style="width: 120px;" class="text-end">จัดการ</th>
+                        </tr>
+                    </thead>
+                    <tbody id="addedItemsTableBody"></tbody>
+                </table>
+            </div>
+
+            <div id="addedItemsEmpty" class="alert alert-secondary mt-3" role="alert" style="display:none;">
+                ยังไม่มีรายการที่เพิ่มไว้
+            </div>
+        </div>
+    </div>
+
+    <!-- Bootstrap 5 JS -->
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <!-- SweetAlert2 -->
+    <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11/dist/sweetalert2.all.min.js"></script>
+
+    <script src="/inventoryData.js"></script>
+</body>
+</html>

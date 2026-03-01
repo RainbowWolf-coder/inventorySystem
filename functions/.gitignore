@@ -1,0 +1,14 @@
+# ===== SECURITY — ห้าม commit ไฟล์เหล่านี้เด็ดขาด =====
+
+# Google Service Account key (มี private key จริง)
+serviceAccount.json
+*serviceAccount*.json
+*.secret.json
+
+# Firebase Functions local env overrides (อาจมี credentials)
+.env.local
+.env.*.local
+.secret.local
+
+# ===== Standard Node / Functions =====
+node_modules/
