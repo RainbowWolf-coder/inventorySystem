@@ -46,7 +46,7 @@ h2,h3,h6{color:#342f52;}
 .badge-ok{background:#5fa685;color:#fff;}
 
 .history-box{
-  max-height:250px;
+  max-height:320px;
   overflow:auto;
   font-size:14px;
 }
@@ -96,4 +96,62 @@ h2,h3,h6{color:#342f52;}
   color:#f8f6ff;
   background-clip:padding-box;
   box-shadow:0 1px 0 rgba(127,118,164,.32);
+}
+
+@media (max-width:575.98px){
+  #inventoryTable{
+    table-layout:fixed;
+  }
+
+  #inventoryTable th,
+  #inventoryTable td{
+    padding:.45rem .4rem;
+  }
+
+  /* Make the name column narrower; allow wrapping to free space for action buttons */
+  #inventoryTable th:nth-child(1),
+  #inventoryTable td:nth-child(1){
+    width:40%;
+    white-space:normal;
+    word-break:break-word;
+  }
+
+  #inventoryTable th:nth-child(2),
+  #inventoryTable td:nth-child(2){ width:14%; }
+
+  #inventoryTable th:nth-child(3),
+  #inventoryTable td:nth-child(3){ width:12%; }
+
+  #inventoryTable th:nth-child(4),
+  #inventoryTable td:nth-child(4){ width:16%; }
+
+  #inventoryTable th:nth-child(5),
+  #inventoryTable td:nth-child(5){
+    width:18%;
+    white-space:nowrap;
+  }
+}
+
+.dashboard-actions{
+  display:flex;
+  flex-wrap:wrap;
+  justify-content:flex-end;
+  gap:.5rem;
+}
+
+@media (max-width:575.98px){
+  .dashboard-actions{
+    display:grid;
+    grid-template-columns:repeat(2,minmax(0,1fr));
+    justify-content:stretch;
+  }
+  .dashboard-actions .btn{
+    width:100%;
+  }
+}
+
+@media (max-width:360px){
+  .dashboard-actions{
+    grid-template-columns:1fr;
+  }
 }

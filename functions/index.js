@@ -2,7 +2,6 @@
 const fs = require('fs');
 const path = require('path');
 const { onRequest } = require('firebase-functions/v2/https');
-const { onDocumentCreated } = require('firebase-functions/v2/firestore');
 const { onSchedule } = require('firebase-functions/v2/scheduler');
 const { defineSecret } = require('firebase-functions/params');
 const admin = require('firebase-admin');
@@ -970,12 +969,21 @@ async function clearRecieveFormForNextMonth() {
   const sheetName = 'RecieveForm';
   const a1SheetName = `'${sheetName.replace(/'/g, "''")}'`;
 
-  await sheets.spreadsheets.values.clear({
-    spreadsheetId,
-    range: `${a1SheetName}!A3:F`,
-  });
+  // Preserve monthly summary/formulas in columns H:I.
+  // Clear data columns A-G and id columns J-K.
+  const ranges = [
+    `${a1SheetName}!A3:G`,
+    `${a1SheetName}!J3:K`,
+  ];
 
-  return { ok: true, clearedRange: 'RecieveForm!A3:F' };
+  for (const range of ranges) {
+    await sheets.spreadsheets.values.clear({
+      spreadsheetId,
+      range,
+    });
+  }
+
+  return { ok: true, clearedRanges: ['RecieveForm!A3:G', 'RecieveForm!J3:K'] };
 }
 
 async function deleteAllWithdrawalsFromFirestore({ batchSize = 450, timeLimitMs = 8 * 60 * 1000 } = {}) {
@@ -1164,6 +1172,205 @@ exports.scheduledMonthlyWithdrawalsReport = onSchedule({
   }
 });
 
+function getLowStockCutoff_(lowStockThreshold) {
+  const threshold = Number(lowStockThreshold);
+  return Number.isFinite(threshold) ? threshold : 5;
+}
+
+// Scheduled: send stock alerts daily at 08:00 Asia/Bangkok.
+// Sends only when there is at least 1 out-of-stock or low-stock item.
+exports.scheduledStockAlertsTelegram = onSchedule({
+  schedule: '0 8 * * *',
+  timeZone: 'Asia/Bangkok',
+  maxInstances: 1,
+  memory: '256MiB',
+  timeoutSeconds: 60,
+  secrets: [
+    TELEGRAM_TOKEN_SECRET,
+    TELEGRAM_CHAT_ID_SECRET,
+  ],
+}, async () => {
+  try {
+    const settings = getRuntimeSettings();
+    if (!settings?.telegramToken || !settings?.telegramChatId) {
+      console.log('scheduledStockAlertsTelegram: skipped (Telegram not configured)');
+      return;
+    }
+
+    if (isFunctionsEmulator() && !hasFirestoreEmulator()) {
+      console.log('scheduledStockAlertsTelegram: skipped (Firestore emulator is not running)');
+      return;
+    }
+
+    const { out, low } = await fetchStockAlertsSnapshot_();
+    if (out.length === 0 && low.length === 0) {
+      console.log('scheduledStockAlertsTelegram: no alerts');
+      return;
+    }
+
+    const message = buildStockAlertsTelegramMessage_({ out, low, includeGreeting: true });
+    const result = await sendTelegramHtmlMessage_(settings, message);
+    console.log('scheduledStockAlertsTelegram: sent', result);
+  } catch (e) {
+    console.error('scheduledStockAlertsTelegram failed:', e);
+  }
+});
+
+function buildStockAlertsTelegramMessage_({ out, low, includeGreeting = false }) {
+  const timeText = formatBangkokDateTime();
+  const divider = '\u2500'.repeat(12);
+  const bullet = '\u2022';
+  const emDash = '\u2014';
+
+  const dashboardUrl = 'https://inventorysystem-d5ff8.web.app/inventoryDashboard.html';
+  const dashboardLink = `<a href="${dashboardUrl}">Dashboard</a>`;
+
+  const lines = [];
+
+  if (includeGreeting) {
+    lines.push('\u2600\uFE0F <b>Good morning</b>');
+    lines.push('\u0E2A\u0E27\u0E31\u0E2A\u0E14\u0E35\u0E15\u0E2D\u0E19\u0E40\u0E0A\u0E49\u0E32\u0E04\u0E23\u0E31\u0E1A \u0E23\u0E30\u0E1A\u0E1A\u0E40\u0E1B\u0E34\u0E14\u0E17\u0E33\u0E01\u0E32\u0E23\u0E41\u0E25\u0E49\u0E27');
+    lines.push('');
+  }
+
+  lines.push('\uD83D\uDCE6 <b>\u0E41\u0E08\u0E49\u0E07\u0E40\u0E15\u0E37\u0E2D\u0E19\u0E2A\u0E15\u0E47\u0E2D\u0E01</b>');
+  lines.push('<code>Inventory System</code>');
+  lines.push(divider);
+  lines.push(`\u23F0 <b>\u0E40\u0E27\u0E25\u0E32</b>: ${escapeTelegramHtml(timeText)}`);
+
+  if ((!out || out.length === 0) && (!low || low.length === 0)) {
+    lines.push(divider);
+    lines.push('\u2705 <b>\u0E2A\u0E16\u0E32\u0E19\u0E30</b>: \u0E44\u0E21\u0E48\u0E21\u0E35\u0E23\u0E32\u0E22\u0E01\u0E32\u0E23\u0E17\u0E35\u0E48\u0E2B\u0E21\u0E14/\u0E43\u0E01\u0E25\u0E49\u0E2B\u0E21\u0E14');
+    lines.push('');
+    lines.push(`\uD83D\uDD0E \u0E14\u0E39\u0E23\u0E32\u0E22\u0E25\u0E30\u0E40\u0E2D\u0E35\u0E22\u0E14\u0E44\u0E14\u0E49\u0E17\u0E35\u0E48 ${dashboardLink}`);
+    return lines.join('\n');
+  }
+
+  const maxShow = 20;
+
+  if (out && out.length > 0) {
+    lines.push(divider);
+    lines.push(`\u274C <b>\u0E2B\u0E21\u0E14\u0E2A\u0E15\u0E47\u0E2D\u0E01</b>: ${escapeTelegramHtml(String(out.length))} \u0E23\u0E32\u0E22\u0E01\u0E32\u0E23`);
+    for (const it of out.slice(0, maxShow)) {
+      const name = escapeTelegramHtml(it.displayName);
+      const unit = escapeTelegramHtml(it.unit);
+      lines.push(`${bullet} ${name} ${emDash} <b>0</b>${unit ? ' ' + unit : ''}`);
+    }
+    if (out.length > maxShow) {
+      lines.push(`<i>\u2026 \u0E41\u0E25\u0E30\u0E2D\u0E35\u0E01 ${escapeTelegramHtml(String(out.length - maxShow))} \u0E23\u0E32\u0E22\u0E01\u0E32\u0E23</i>`);
+    }
+  }
+
+  if (low && low.length > 0) {
+    lines.push(divider);
+    lines.push(`\u26A0\uFE0F <b>\u0E43\u0E01\u0E25\u0E49\u0E2B\u0E21\u0E14</b>: ${escapeTelegramHtml(String(low.length))} \u0E23\u0E32\u0E22\u0E01\u0E32\u0E23`);
+    for (const it of low.slice(0, maxShow)) {
+      const name = escapeTelegramHtml(it.displayName);
+      const qty = escapeTelegramHtml(String(it.remainingQty));
+      const unit = escapeTelegramHtml(it.unit);
+      lines.push(`${bullet} ${name} ${emDash} <b>${qty}</b>${unit ? ' ' + unit : ''}`);
+    }
+    if (low.length > maxShow) {
+      lines.push(`<i>\u2026 \u0E41\u0E25\u0E30\u0E2D\u0E35\u0E01 ${escapeTelegramHtml(String(low.length - maxShow))} \u0E23\u0E32\u0E22\u0E01\u0E32\u0E23</i>`);
+    }
+  }
+
+  lines.push('');
+  lines.push(`\uD83D\uDD0E \u0E14\u0E39\u0E23\u0E32\u0E22\u0E25\u0E30\u0E40\u0E2D\u0E35\u0E22\u0E14\u0E44\u0E14\u0E49\u0E17\u0E35\u0E48 ${dashboardLink}`);
+
+  return lines.join('\n');
+}
+
+async function fetchStockAlertsSnapshot_() {
+  const snap = await getDb().collection('stockItems').get();
+  const items = snap.docs
+    .map((d) => d.data() || {})
+    .map((data) => ({
+      displayName: (data.displayName ?? '').toString().trim(),
+      remainingQty: (typeof data.remainingQty === 'number') ? data.remainingQty : null,
+      unit: (data.unit ?? '').toString().trim(),
+      lowStockThreshold: (typeof data.lowStockThreshold === 'number') ? data.lowStockThreshold : null,
+    }))
+    .filter((it) => it.displayName !== '' && typeof it.remainingQty === 'number' && Number.isFinite(it.remainingQty));
+
+  const out = [];
+  const low = [];
+  for (const it of items) {
+    const stock = Number(it.remainingQty);
+    const cutoff = getLowStockCutoff_(it.lowStockThreshold);
+    if (stock === 0) out.push(it);
+    else if (stock > 0 && stock <= cutoff) low.push(it);
+  }
+
+  out.sort((a, b) => a.displayName.localeCompare(b.displayName, 'th', { sensitivity: 'base' }));
+  low.sort((a, b) => a.displayName.localeCompare(b.displayName, 'th', { sensitivity: 'base' }));
+
+  return { out, low };
+}
+
+// POST /api/sendStockAlertsTelegramNow (manual test)
+// Protected by SYNC_TOKEN via header x-sync-token
+exports.sendStockAlertsTelegramNow = onRequest({
+  maxInstances: 1,
+  invoker: 'public',
+  secrets: [
+    SYNC_TOKEN_SECRET,
+    TELEGRAM_TOKEN_SECRET,
+    TELEGRAM_CHAT_ID_SECRET,
+  ],
+}, async (req, res) => {
+  return cors(req, res, async () => {
+    try {
+      if (req.method === 'OPTIONS') {
+        res.status(204).send('');
+        return;
+      }
+
+      if (req.method !== 'POST') {
+        res.status(405).json({ success: false, message: 'Method Not Allowed' });
+        return;
+      }
+
+      if (!ensureSyncTokenAuthorized(req, res)) {
+        return;
+      }
+
+      const settings = getRuntimeSettings();
+      if (!settings?.telegramToken || !settings?.telegramChatId) {
+        res.status(200).json({
+          success: true,
+          sent: false,
+          message: 'Missing TELEGRAM_TOKEN or TELEGRAM_CHAT_ID',
+        });
+        return;
+      }
+
+      if (isFunctionsEmulator() && !hasFirestoreEmulator()) {
+        res.status(200).json({
+          success: true,
+          sent: false,
+          message: 'Firestore emulator is not running',
+        });
+        return;
+      }
+
+      const { out, low } = await fetchStockAlertsSnapshot_();
+      const message = buildStockAlertsTelegramMessage_({ out, low, includeGreeting: true });
+      const telegram = await sendTelegramHtmlMessage_(settings, message);
+
+      res.status(200).json({
+        success: true,
+        sent: true,
+        counts: { out: out.length, low: low.length },
+        telegram,
+      });
+    } catch (e) {
+      console.error('Error in sendStockAlertsTelegramNow:', e);
+      res.status(500).json({ success: false, message: e?.message || 'sendStockAlertsTelegramNow failed' });
+    }
+  });
+});
+
 function getRuntimeSettings() {
   const telegramToken = pickSetting({
     secretParam: TELEGRAM_TOKEN_SECRET,
@@ -1232,7 +1439,7 @@ function getRuntimeSettings() {
   };
 }
 
-async function appendToSheet({ spreadsheetId, googleClientEmail, googlePrivateKey }, items) {
+async function appendToSheet({ spreadsheetId, googleClientEmail, googlePrivateKey }, items, { withdrawalId } = {}) {
   const google = getGoogle();
   const auth = new google.auth.GoogleAuth({
     credentials: {
@@ -1244,28 +1451,294 @@ async function appendToSheet({ spreadsheetId, googleClientEmail, googlePrivateKe
 
   const sheets = google.sheets({ version: 'v4', auth });
 
-  // Date only (dd/MM/yyyy) in Thailand timezone (GMT+7)
+  // DateTime (dd/MM/yyyy HH:mm:ss) in Thailand timezone (GMT+7)
   const timestamp = new Intl.DateTimeFormat('en-GB', {
     timeZone: 'Asia/Bangkok',
     day: '2-digit',
     month: '2-digit',
     year: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
   }).format(new Date());
-  const rowsToAppend = items.map((item) => [
+  const wid = (withdrawalId ?? '').toString().trim();
+  // RecieveForm columns (required by user):
+  // A timestamp, B name, C item, D qty, E unit, F withdrawalId
+  // NOTE: We intentionally write with values.update to a specific A:F range.
+  // Google Sheets values.append tries to "find the table" within the given range
+  // and may append to another table (e.g., starting at column H) if the sheet layout changes.
+  const rowsToWrite = items.map((item) => [
     timestamp,
     item.name ?? '',
     item.item ?? '',
     item.quantity ?? '',
-    item.unit ?? ''
+    item.unit ?? '',
+    wid,
   ]);
 
-  await sheets.spreadsheets.values.append({
-    spreadsheetId: requireString(spreadsheetId, 'SPREADSHEET_ID (or sheet.id)'),
-    // Row 1: month, Row 2: headers/details -> start data at Row 3
-    range: 'RecieveForm!A3:E',
-    valueInputOption: 'USER_ENTERED',
-    requestBody: { values: rowsToAppend },
+  const effectiveSpreadsheetId = requireString(spreadsheetId, 'SPREADSHEET_ID (or sheet.id)');
+  const sheetName = 'RecieveForm';
+  const a1SheetName = `'${sheetName.replace(/'/g, "''")}'`;
+
+  try {
+    // Determine next row based on column A (starting from row 3).
+    const colAResp = await sheets.spreadsheets.values.get({
+      spreadsheetId: effectiveSpreadsheetId,
+      range: `${a1SheetName}!A3:A`,
+      majorDimension: 'ROWS',
+      valueRenderOption: 'UNFORMATTED_VALUE',
+    });
+    const colAValues = Array.isArray(colAResp?.data?.values) ? colAResp.data.values : [];
+    const nextRow = 3 + colAValues.length;
+    const endRow = nextRow + rowsToWrite.length - 1;
+    const targetRange = `${sheetName}!A${nextRow}:F${endRow}`;
+
+    const resp = await sheets.spreadsheets.values.update({
+      spreadsheetId: effectiveSpreadsheetId,
+      range: targetRange,
+      valueInputOption: 'USER_ENTERED',
+      requestBody: { values: rowsToWrite },
+    });
+
+    return {
+      ok: true,
+      spreadsheetId: effectiveSpreadsheetId,
+      range: targetRange,
+      updatedRange: resp?.data?.updatedRange ?? null,
+      updatedRows: resp?.data?.updatedRows ?? null,
+      updatedColumns: resp?.data?.updatedColumns ?? null,
+      updatedCells: resp?.data?.updatedCells ?? null,
+    };
+  } catch (e) {
+    const status = e?.response?.status ?? null;
+    const apiError = e?.response?.data ?? null;
+    const apiMessage = apiError?.error?.message || e?.message || 'write failed';
+
+    let availableTabs = null;
+    try {
+      const meta = await sheets.spreadsheets.get({
+        spreadsheetId: effectiveSpreadsheetId,
+        fields: 'sheets(properties(title))',
+      });
+      const titles = (meta?.data?.sheets || [])
+        .map((s) => s?.properties?.title)
+        .filter((t) => typeof t === 'string' && t.trim() !== '');
+      availableTabs = titles.slice(0, 30);
+    } catch {}
+
+    console.error('appendToSheet failed:', {
+      status,
+      apiError,
+      message: e?.message || null,
+      sheetName,
+      availableTabs,
+    });
+
+    const tabsText = Array.isArray(availableTabs) && availableTabs.length > 0
+      ? ` Available tabs: ${availableTabs.join(', ')}`
+      : '';
+
+    throw new Error(`Google Sheets write failed${status ? ` (HTTP ${status})` : ''}: ${apiMessage}. Sheet: ${sheetName}.${tabsText}`);
+  }
+}
+
+function buildAllstockRemainingFormula_(rowNumber1Based) {
+  const r = Number(rowNumber1Based);
+  if (!Number.isFinite(r) || r <= 0) {
+    throw new Error('Invalid row number for formula');
+  }
+
+  // User-provided formula pattern. Keep it stable.
+  // remaining = incoming(D) - SUMIF(RecieveForm item, this row's item, RecieveForm qty)
+  return `=D${r}-SUMIF(RecieveForm!$C$3:$C$9879,C${r},RecieveForm!$D$3:$D$9879)`;
+}
+
+function parseA1RowStart_(a1Range) {
+  const s = (a1Range || '').toString();
+  // Examples: "AllstockV2!A12:M12" or "'AllstockV2'!A12:M12"
+  const m = s.match(/![A-Z]+(\d+):[A-Z]+(\d+)$/);
+  if (!m) return null;
+  const start = Number(m[1]);
+  const end = Number(m[2]);
+  if (!Number.isFinite(start) || !Number.isFinite(end)) return null;
+  return { startRow: start, endRow: end };
+}
+
+async function getSheetsClient_(settings, { readOnly = false } = {}) {
+  const google = getGoogle();
+  const auth = new google.auth.GoogleAuth({
+    credentials: {
+      client_email: requireString(settings.googleClientEmail, 'GOOGLE_CLIENT_EMAIL'),
+      private_key: requireString(settings.googlePrivateKey, 'GOOGLE_PRIVATE_KEY'),
+    },
+    scopes: [readOnly
+      ? 'https://www.googleapis.com/auth/spreadsheets.readonly'
+      : 'https://www.googleapis.com/auth/spreadsheets'],
   });
+  return google.sheets({ version: 'v4', auth });
+}
+
+async function appendStockItemToAllstockSheet_(settings, {
+  displayName,
+  incomingQty,
+  unit,
+  note,
+  itemId,
+}) {
+  const spreadsheetId = requireString(settings.spreadsheetId, 'SPREADSHEET_ID');
+  const sheets = await getSheetsClient_(settings, { readOnly: false });
+
+  const sheetName = 'AllstockV2';
+  const a1SheetName = `'${sheetName.replace(/'/g, "''")}'`;
+
+  // IMPORTANT: Do NOT use values.append here.
+  // It may append to a different table within the range (e.g., starting at column H)
+  // depending on sheet layout. We must write to fixed columns explicitly.
+
+  const resp = await sheets.spreadsheets.values.get({
+    spreadsheetId,
+    range: `${a1SheetName}!A:M`,
+    majorDimension: 'ROWS',
+    valueRenderOption: 'UNFORMATTED_VALUE',
+  });
+  const rows = Array.isArray(resp?.data?.values) ? resp.data.values : [];
+
+  // Identify header row and data start row.
+  let headerRowIndex0 = -1;
+  for (let r = 0; r < Math.min(rows.length, 20); r++) {
+    const row = rows[r] || [];
+    const foundItem = row.findIndex((c) => (c ?? '').toString().trim() === SHEET_HEADER_ITEM);
+    if (foundItem >= 0) {
+      headerRowIndex0 = r;
+      break;
+    }
+  }
+  const dataStartRow1 = (headerRowIndex0 >= 0) ? (headerRowIndex0 + 2) : 3;
+
+  // Find last row that has our table content (column C or M).
+  let lastDataRow1 = dataStartRow1 - 1;
+  for (let r = rows.length - 1; r >= dataStartRow1 - 1; r--) {
+    const row = rows[r] || [];
+    const c = (row[2] ?? '').toString().trim();
+    const m = (row[12] ?? '').toString().trim();
+    if (c !== '' || m !== '') {
+      lastDataRow1 = r + 1;
+      break;
+    }
+  }
+  const targetRow1 = Math.max(dataStartRow1, lastDataRow1 + 1);
+
+  const formula = buildAllstockRemainingFormula_(targetRow1);
+  const rowCtoG = [
+    displayName || '',
+    incomingQty ?? '',
+    formula,
+    unit || '',
+    note || '',
+  ];
+
+  const rangeCtoG = `${sheetName}!C${targetRow1}:G${targetRow1}`;
+  const rangeM = `${sheetName}!M${targetRow1}`;
+
+  await sheets.spreadsheets.values.update({
+    spreadsheetId,
+    range: rangeCtoG,
+    valueInputOption: 'USER_ENTERED',
+    requestBody: { values: [rowCtoG] },
+  });
+
+  await sheets.spreadsheets.values.update({
+    spreadsheetId,
+    range: rangeM,
+    valueInputOption: 'USER_ENTERED',
+    requestBody: { values: [[itemId || '']] },
+  });
+
+  return { ok: true, rowNumber: targetRow1, updatedRanges: [rangeCtoG, rangeM] };
+}
+
+async function deleteStockItemFromAllstockSheet_(settings, { itemId, displayName }) {
+  const spreadsheetId = requireString(settings.spreadsheetId, 'SPREADSHEET_ID');
+  const sheets = await getSheetsClient_(settings, { readOnly: false });
+
+  const sheetName = 'AllstockV2';
+  const a1SheetName = `'${sheetName.replace(/'/g, "''")}'`;
+  const itemIdText = (itemId || '').toString().trim();
+  const nameText = (displayName || '').toString().trim().replace(/\s+/g, ' ');
+
+  // Read A:M to find row indexes.
+  const resp = await sheets.spreadsheets.values.get({
+    spreadsheetId,
+    range: `${a1SheetName}!A:M`,
+    majorDimension: 'ROWS',
+    valueRenderOption: 'UNFORMATTED_VALUE',
+  });
+  const rows = Array.isArray(resp?.data?.values) ? resp.data.values : [];
+  if (rows.length === 0) return { ok: true, deletedRows: 0, matchedRows: [] };
+
+  // Find sheetId (numeric) for deleteDimension.
+  const meta = await sheets.spreadsheets.get({
+    spreadsheetId,
+    fields: 'sheets(properties(sheetId,title))',
+  });
+  const sheetId = (meta?.data?.sheets || [])
+    .map((s) => s?.properties)
+    .find((p) => (p?.title || '').toString() === sheetName)?.sheetId;
+  if (typeof sheetId !== 'number') {
+    throw new Error('Cannot resolve sheetId for AllstockV2');
+  }
+
+  // Identify header row and skip it.
+  let headerRowIndex0 = -1;
+  for (let r = 0; r < Math.min(rows.length, 10); r++) {
+    const row = rows[r] || [];
+    const foundItem = row.findIndex((c) => (c ?? '').toString().trim() === SHEET_HEADER_ITEM);
+    if (foundItem >= 0) {
+      headerRowIndex0 = r;
+      break;
+    }
+  }
+
+  const matches = [];
+  for (let r = 0; r < rows.length; r++) {
+    if (headerRowIndex0 >= 0 && r === headerRowIndex0) continue;
+    const row = rows[r] || [];
+    const rowName = (row[2] ?? '').toString().trim().replace(/\s+/g, ' ');
+    const rowId = (row[12] ?? '').toString().trim();
+
+    const idMatch = itemIdText && ((rowId && rowId === itemIdText) || row.some((c) => (c ?? '').toString().trim() === itemIdText));
+    const nameMatch = !itemIdText && nameText && (rowName && rowName === nameText);
+    if (idMatch || nameMatch) {
+      matches.push({ rowNumber: r + 1, rowName, rowId });
+    }
+  }
+
+  if (matches.length === 0) {
+    throw new Error('AllstockV2: item not found');
+  }
+
+  // Delete bottom-up to avoid index shifting.
+  const requests = matches
+    .slice()
+    .sort((a, b) => b.rowNumber - a.rowNumber)
+    .map((m) => ({
+      deleteDimension: {
+        range: {
+          sheetId,
+          dimension: 'ROWS',
+          startIndex: m.rowNumber - 1,
+          endIndex: m.rowNumber,
+        },
+      },
+    }));
+
+  await sheets.spreadsheets.batchUpdate({
+    spreadsheetId,
+    requestBody: { requests },
+  });
+
+  return { ok: true, deletedRows: matches.length, matchedRows: matches };
 }
 
 async function upsertRequesterName(rawName) {
@@ -1284,227 +1757,6 @@ async function upsertRequesterName(rawName) {
   }, { merge: true });
 }
 
-function computeSheetHash({ displayName, remainingQty, unit, lowStockThreshold }) {
-  const normalizedName = (displayName ?? '').toString().trim().replace(/\s+/g, ' ');
-  const normalizedUnit = (unit ?? '').toString().trim().replace(/\s+/g, ' ') || null;
-  const normalizedRemaining = (typeof remainingQty === 'number' && Number.isFinite(remainingQty)) ? remainingQty : null;
-  const normalizedLow = (typeof lowStockThreshold === 'number' && Number.isFinite(lowStockThreshold)) ? lowStockThreshold : null;
-  const payload = JSON.stringify([normalizedName, normalizedRemaining, normalizedUnit, normalizedLow]);
-  return crypto.createHash('sha1').update(payload).digest('hex');
-}
-
-async function getExistingStockItemsByDocId(docIds) {
-  const unique = Array.from(new Set((docIds || []).filter(Boolean)));
-  const out = new Map();
-  const chunkSize = 100;
-
-  for (let i = 0; i < unique.length; i += chunkSize) {
-    const chunk = unique.slice(i, i + chunkSize);
-    const refs = chunk.map((id) => getDb().collection('stockItems').doc(id));
-    const snaps = await getDb().getAll(...refs);
-    for (const snap of snaps) {
-      if (!snap.exists) continue;
-      out.set(snap.id, snap.data() || {});
-    }
-  }
-
-  return out;
-}
-
-async function upsertStockItems(items) {
-  const now = admin.firestore.FieldValue.serverTimestamp();
-
-  const normalized = (items || [])
-    .map((it) => {
-      if (typeof it === 'string') {
-        const displayName = it.toString().trim().replace(/\s+/g, ' ');
-        return { displayName };
-      }
-
-      const displayName = (it?.displayName ?? it?.name ?? '').toString().trim().replace(/\s+/g, ' ');
-      const unit = (it?.unit ?? '').toString().trim().replace(/\s+/g, ' ');
-      const remainingRaw = it?.remainingQty;
-      const remainingQty = Number.isFinite(Number(remainingRaw)) ? Number(remainingRaw) : null;
-
-      const lowRaw = (it?.lowStockThreshold ?? it?.low_threshold ?? it?.lowThreshold ?? it?.threshold);
-      const lowStockThreshold = (lowRaw === '' || lowRaw === null || typeof lowRaw === 'undefined')
-        ? null
-        : (Number.isFinite(Number(lowRaw)) ? Number(lowRaw) : null);
-      return {
-        displayName,
-        unit,
-        remainingQty,
-        lowStockThreshold,
-      };
-    })
-    .filter((it) => it.displayName !== '');
-
-  // Dedupe by normalized key (preserve first occurrence)
-  const seen = new Set();
-  const unique = [];
-  for (const it of normalized) {
-    const key = normalizeItemKey(it.displayName);
-    if (!key || seen.has(key)) continue;
-    seen.add(key);
-    unique.push({ ...it, searchKey: key, docId: itemDocIdFromKey(key) });
-  }
-
-  const docs = unique.map((d) => ({
-    ...d,
-    sheetHash: computeSheetHash(d),
-  }));
-
-  const existingById = await getExistingStockItemsByDocId(docs.map((d) => d.docId));
-
-  const toWrite = [];
-  let skipped = 0;
-  for (const d of docs) {
-    const existing = existingById.get(d.docId);
-    const existingHash = (existing?.sheetHash || '').toString();
-
-    if (existing && existingHash && existingHash === d.sheetHash) {
-      skipped += 1;
-      continue;
-    }
-
-    toWrite.push(d);
-  }
-
-  // Firestore batch limit: 500 writes.
-  const chunkSize = 450;
-  for (let i = 0; i < toWrite.length; i += chunkSize) {
-    const chunk = toWrite.slice(i, i + chunkSize);
-    const batch = getDb().batch();
-    for (const d of chunk) {
-      const exists = existingById.has(d.docId);
-      const ref = getDb().collection('stockItems').doc(d.docId);
-      const payload = {
-        displayName: d.displayName,
-        searchKey: d.searchKey,
-        // from sheet
-        remainingQty: d.remainingQty,
-        unit: d.unit || null,
-        lowStockThreshold: (typeof d.lowStockThreshold === 'number' && Number.isFinite(d.lowStockThreshold)) ? d.lowStockThreshold : null,
-        sheetHash: d.sheetHash,
-        sheetUpdatedAt: now,
-        updatedAt: now,
-      };
-      if (!exists) {
-        payload.createdAt = now;
-      }
-      batch.set(ref, payload, { merge: true });
-    }
-    await batch.commit();
-  }
-
-  return { total: docs.length, written: toWrite.length, skipped };
-}
-
-async function fetchStockItemsFromSheet(settings) {
-  const google = getGoogle();
-  const auth = new google.auth.GoogleAuth({
-    credentials: {
-      client_email: requireString(settings.googleClientEmail, 'GOOGLE_CLIENT_EMAIL'),
-      private_key: requireString(settings.googlePrivateKey, 'GOOGLE_PRIVATE_KEY'),
-    },
-    scopes: ['https://www.googleapis.com/auth/spreadsheets.readonly'],
-  });
-  const sheets = google.sheets({ version: 'v4', auth });
-
-  const spreadsheetId = requireString(settings.spreadsheetId, 'SPREADSHEET_ID');
-  const sheetName = 'AllstockV2';
-  const a1SheetName = `'${sheetName.replace(/'/g, "''")}'`;
-  const resp = await sheets.spreadsheets.values.get({
-    spreadsheetId,
-    range: `${a1SheetName}!A:Z`,
-    majorDimension: 'ROWS',
-    valueRenderOption: 'UNFORMATTED_VALUE',
-  });
-
-  const rows = Array.isArray(resp?.data?.values) ? resp.data.values : [];
-  if (rows.length === 0) {
-    return { items: [], detail: 'No rows returned' };
-  }
-
-  // Find header row that contains "รายการ"
-  const headerNeedle = SHEET_HEADER_ITEM;
-  const remainNeedle = SHEET_HEADER_REMAINING;
-  const unitNeedle = SHEET_HEADER_UNIT;
-
-  let headerRowIndex = 0;
-  let itemCol = -1;
-  let remainingCol = -1;
-  let unitCol = -1;
-  let lowStockThresholdCol = -1;
-
-  for (let r = 0; r < Math.min(rows.length, 10); r++) {
-    const row = rows[r] || [];
-    const foundItem = row.findIndex((c) => (c ?? '').toString().trim() === headerNeedle);
-    if (foundItem >= 0) {
-      headerRowIndex = r;
-      itemCol = foundItem;
-      remainingCol = row.findIndex((c) => (c ?? '').toString().trim() === remainNeedle);
-      unitCol = row.findIndex((c) => (c ?? '').toString().trim() === unitNeedle);
-
-      // User-defined threshold column (K). If there is a header for it, use it; otherwise default to K.
-      lowStockThresholdCol = row.findIndex((c) => LOW_STOCK_THRESHOLD_HEADERS.includes((c ?? '').toString().trim()));
-      break;
-    }
-  }
-
-  // Fallback to the known layout: C=รายการ, E=คงเหลือ, F=หน่วย
-  if (itemCol < 0) itemCol = 2;
-  if (remainingCol < 0) remainingCol = 4;
-  if (unitCol < 0) unitCol = 5;
-  // Column K (1-based) => index 10 (0-based)
-  if (lowStockThresholdCol < 0) lowStockThresholdCol = 10;
-
-  const items = [];
-  for (let r = headerRowIndex + 1; r < rows.length; r++) {
-    const row = rows[r] || [];
-    const rawName = row[itemCol];
-    const displayName = (rawName ?? '').toString().trim().replace(/\s+/g, ' ');
-    if (!displayName) continue;
-
-    const rawRemaining = row[remainingCol];
-    const remainingQty = (rawRemaining === '' || rawRemaining === null || typeof rawRemaining === 'undefined')
-      ? null
-      : (Number.isFinite(Number(rawRemaining)) ? Number(rawRemaining) : null);
-    const unit = (row[unitCol] ?? '').toString().trim().replace(/\s+/g, ' ');
-
-    const rawLow = row[lowStockThresholdCol];
-    const lowStockThreshold = (rawLow === '' || rawLow === null || typeof rawLow === 'undefined')
-      ? null
-      : (Number.isFinite(Number(rawLow)) ? Number(rawLow) : null);
-
-    items.push({
-      displayName,
-      remainingQty,
-      unit: unit || null,
-      lowStockThreshold,
-    });
-  }
-
-  // Dedupe while preserving first-seen order
-  const seen = new Set();
-  const unique = [];
-  for (const it of items) {
-    const k = normalizeItemKey(it.displayName);
-    if (!k || seen.has(k)) continue;
-    seen.add(k);
-    unique.push(it);
-  }
-
-  return {
-    items: unique,
-    headerRowIndex,
-    colIndex: itemCol,
-    remainingColIndex: remainingCol,
-    unitColIndex: unitCol,
-    lowStockThresholdColIndex: lowStockThresholdCol,
-  };
-}
-
 async function storeWithdrawal(items) {
   const now = admin.firestore.FieldValue.serverTimestamp();
   const name = (items[0]?.name || '').toString().trim();
@@ -1515,7 +1767,7 @@ async function storeWithdrawal(items) {
     unit: (it?.unit || '').toString().trim(),
   }));
 
-  await getDb().collection('withdrawals').add({
+  const ref = await getDb().collection('withdrawals').add({
     name,
     items: normalizedItems,
     createdAt: now,
@@ -1523,6 +1775,291 @@ async function storeWithdrawal(items) {
   });
 
   clearCachedResponses(['withdrawals:', 'withdrawalStats:']);
+
+  return { id: ref.id };
+}
+
+function aggregateWithdrawalDeltas_(items) {
+  const byDocId = new Map();
+
+  for (const it of (items || [])) {
+    const displayName = (it?.item ?? '').toString().trim().replace(/\s+/g, ' ');
+    const qty = Number(it?.quantity);
+    if (!displayName) continue;
+    if (!Number.isFinite(qty) || qty === 0) continue;
+
+    const unit = (it?.unit ?? '').toString().trim().replace(/\s+/g, ' ') || null;
+    const itemKey = normalizeItemKey(displayName);
+    if (!itemKey) continue;
+
+    const docId = itemDocIdFromKey(itemKey);
+    const existing = byDocId.get(docId) || {
+      docId,
+      displayName,
+      searchKey: itemKey,
+      unit,
+      delta: 0,
+    };
+
+    existing.delta += qty;
+    // Prefer first non-empty unit
+    if (!existing.unit && unit) existing.unit = unit;
+    byDocId.set(docId, existing);
+  }
+
+  // Convert to array, drop zeros
+  return Array.from(byDocId.values()).filter((d) => Number.isFinite(d.delta) && d.delta !== 0);
+}
+
+async function applyWithdrawalStockDeltas_(items) {
+  const deltas = aggregateWithdrawalDeltas_(items);
+  if (deltas.length === 0) {
+    return { ok: true, total: 0, updated: 0, skipped: 0 };
+  }
+
+  const now = admin.firestore.FieldValue.serverTimestamp();
+  const inc = admin.firestore.FieldValue.increment;
+
+  // Firestore batch limit is 500 writes.
+  const chunkSize = 450;
+  let updated = 0;
+  let skipped = 0;
+
+  for (let i = 0; i < deltas.length; i += chunkSize) {
+    const chunk = deltas.slice(i, i + chunkSize);
+    const batch = getDb().batch();
+
+    for (const d of chunk) {
+      const qty = Number(d.delta);
+      if (!Number.isFinite(qty) || qty === 0) {
+        skipped += 1;
+        continue;
+      }
+
+      const ref = getDb().collection('stockItems').doc(d.docId);
+      batch.set(ref, {
+        displayName: d.displayName,
+        searchKey: d.searchKey,
+        // Decrement stock: withdrawal qty is positive -> remainingQty -= qty
+        remainingQty: inc(-qty),
+        unit: d.unit || null,
+        updatedAt: now,
+        stockUpdatedAt: now,
+        stockUpdateSource: 'recordData',
+      }, { merge: true });
+      updated += 1;
+    }
+
+    await batch.commit();
+  }
+
+  return { ok: true, total: deltas.length, updated, skipped };
+}
+
+async function applyRestoreStockDeltas_(items) {
+  const deltas = aggregateWithdrawalDeltas_(items);
+  if (deltas.length === 0) {
+    return { ok: true, total: 0, updated: 0, skipped: 0 };
+  }
+
+  const now = admin.firestore.FieldValue.serverTimestamp();
+  const inc = admin.firestore.FieldValue.increment;
+
+  const chunkSize = 450;
+  let updated = 0;
+  let skipped = 0;
+
+  for (let i = 0; i < deltas.length; i += chunkSize) {
+    const chunk = deltas.slice(i, i + chunkSize);
+    const batch = getDb().batch();
+
+    for (const d of chunk) {
+      const qty = Number(d.delta);
+      if (!Number.isFinite(qty) || qty === 0) {
+        skipped += 1;
+        continue;
+      }
+
+      const ref = getDb().collection('stockItems').doc(d.docId);
+      batch.set(ref, {
+        displayName: d.displayName,
+        searchKey: d.searchKey,
+        // Restore stock: remainingQty += qty
+        remainingQty: inc(qty),
+        unit: d.unit || null,
+        updatedAt: now,
+        stockUpdatedAt: now,
+        stockUpdateSource: 'deleteWithdrawal',
+      }, { merge: true });
+      updated += 1;
+    }
+
+    await batch.commit();
+  }
+
+  return { ok: true, total: deltas.length, updated, skipped };
+}
+
+async function findRecieveFormRowsByWithdrawalId_(settings, withdrawalId) {
+  const spreadsheetId = requireString(settings.spreadsheetId, 'SPREADSHEET_ID');
+  const sheets = await getSheetsClient_(settings, { readOnly: false });
+  const sheetName = 'RecieveForm';
+  const a1SheetName = `'${sheetName.replace(/'/g, "''")}'`;
+  const wid = (withdrawalId || '').toString().trim();
+  if (!wid) return { sheetId: null, rowNumbers: [] };
+
+  const resp = await sheets.spreadsheets.values.get({
+    spreadsheetId,
+    range: `${a1SheetName}!A3:F`,
+    majorDimension: 'ROWS',
+    valueRenderOption: 'UNFORMATTED_VALUE',
+  });
+  const rows = Array.isArray(resp?.data?.values) ? resp.data.values : [];
+
+  // Resolve sheetId for deleteDimension.
+  const meta = await sheets.spreadsheets.get({
+    spreadsheetId,
+    fields: 'sheets(properties(sheetId,title))',
+  });
+  const sheetId = (meta?.data?.sheets || [])
+    .map((s) => s?.properties)
+    .find((p) => (p?.title || '').toString() === sheetName)?.sheetId;
+  if (typeof sheetId !== 'number') {
+    throw new Error('Cannot resolve sheetId for RecieveForm');
+  }
+
+  const rowNumbers = [];
+  for (let i = 0; i < rows.length; i++) {
+    const row = Array.isArray(rows[i]) ? rows[i] : [];
+    // Column F (1-based) => index 5 (0-based)
+    const rowWid = (row[5] ?? '').toString().trim();
+    if (rowWid && rowWid === wid) {
+      rowNumbers.push(3 + i);
+    }
+  }
+
+  return { sheetId, rowNumbers };
+}
+
+function formatBkkDateOnly_(isoString) {
+  if (!isoString) return '';
+  try {
+    const dt = new Date(isoString);
+    return new Intl.DateTimeFormat('en-GB', {
+      timeZone: 'Asia/Bangkok',
+      day: '2-digit',
+      month: '2-digit',
+      year: 'numeric',
+    }).format(dt);
+  } catch {
+    return '';
+  }
+}
+
+async function findRecieveFormRowsByContentFallback_(settings, withdrawal) {
+  const spreadsheetId = requireString(settings.spreadsheetId, 'SPREADSHEET_ID');
+  const sheets = await getSheetsClient_(settings, { readOnly: false });
+  const sheetName = 'RecieveForm';
+  const a1SheetName = `'${sheetName.replace(/'/g, "''")}'`;
+
+  const resp = await sheets.spreadsheets.values.get({
+    spreadsheetId,
+    range: `${a1SheetName}!A3:E`,
+    majorDimension: 'ROWS',
+    valueRenderOption: 'UNFORMATTED_VALUE',
+  });
+  const rows = Array.isArray(resp?.data?.values) ? resp.data.values : [];
+
+  const meta = await sheets.spreadsheets.get({
+    spreadsheetId,
+    fields: 'sheets(properties(sheetId,title))',
+  });
+  const sheetId = (meta?.data?.sheets || [])
+    .map((s) => s?.properties)
+    .find((p) => (p?.title || '').toString() === sheetName)?.sheetId;
+  if (typeof sheetId !== 'number') {
+    throw new Error('Cannot resolve sheetId for RecieveForm');
+  }
+
+  const name = (withdrawal?.name ?? '').toString().trim().replace(/\s+/g, ' ');
+  const items = Array.isArray(withdrawal?.items) ? withdrawal.items : [];
+  if (!name || items.length === 0) return { sheetId, rowNumbers: [] };
+
+  const dateOnly = formatBkkDateOnly_(withdrawal?.createdAt);
+  const expected = items.map((it) => ({
+    item: (it?.item ?? '').toString().trim().replace(/\s+/g, ' '),
+    qty: Number(it?.quantity),
+    unit: (it?.unit ?? '').toString().trim().replace(/\s+/g, ' '),
+  }));
+
+  // Find contiguous block matches.
+  const candidates = [];
+  for (let i = 0; i <= rows.length - expected.length; i++) {
+    const first = Array.isArray(rows[i]) ? rows[i] : [];
+    const ts = (first[0] ?? '').toString();
+    const rowName = (first[1] ?? '').toString().trim().replace(/\s+/g, ' ');
+    if (rowName !== name) continue;
+    if (dateOnly && ts && !ts.startsWith(dateOnly)) continue;
+
+    let ok = true;
+    for (let j = 0; j < expected.length; j++) {
+      const row = Array.isArray(rows[i + j]) ? rows[i + j] : [];
+      const ts2 = (row[0] ?? '').toString();
+      const rowName2 = (row[1] ?? '').toString().trim().replace(/\s+/g, ' ');
+      const rowItem = (row[2] ?? '').toString().trim().replace(/\s+/g, ' ');
+      const rowQty = Number(row[3]);
+      const rowUnit = (row[4] ?? '').toString().trim().replace(/\s+/g, ' ');
+
+      if (rowName2 !== name) { ok = false; break; }
+      if (dateOnly && ts2 && !ts2.startsWith(dateOnly)) { ok = false; break; }
+      if (rowItem !== expected[j].item) { ok = false; break; }
+      if (!Number.isFinite(expected[j].qty) || !Number.isFinite(rowQty) || rowQty !== expected[j].qty) { ok = false; break; }
+      if ((rowUnit || '') !== (expected[j].unit || '')) { ok = false; break; }
+    }
+    if (ok) candidates.push(i);
+  }
+
+  if (candidates.length !== 1) {
+    return { sheetId, rowNumbers: [], ambiguous: candidates.length };
+  }
+
+  const start = candidates[0];
+  const rowNumbers = [];
+  for (let j = 0; j < expected.length; j++) {
+    rowNumbers.push(3 + start + j);
+  }
+  return { sheetId, rowNumbers, ambiguous: 0 };
+}
+
+async function deleteRecieveFormRows_(settings, { sheetId, rowNumbers }) {
+  const spreadsheetId = requireString(settings.spreadsheetId, 'SPREADSHEET_ID');
+  const sheets = await getSheetsClient_(settings, { readOnly: false });
+  if (typeof sheetId !== 'number') throw new Error('Missing sheetId');
+  const nums = Array.from(new Set((rowNumbers || []).filter((n) => Number.isFinite(Number(n)) && Number(n) >= 3)))
+    .map((n) => Number(n));
+  if (nums.length === 0) return { ok: true, deletedRows: 0 };
+
+  // Delete bottom-up.
+  const requests = nums
+    .slice()
+    .sort((a, b) => b - a)
+    .map((rowNumber) => ({
+      deleteDimension: {
+        range: {
+          sheetId,
+          dimension: 'ROWS',
+          startIndex: rowNumber - 1,
+          endIndex: rowNumber,
+        },
+      },
+    }));
+
+  await sheets.spreadsheets.batchUpdate({
+    spreadsheetId,
+    requestBody: { requests },
+  });
+
+  return { ok: true, deletedRows: nums.length };
 }
 
 function escapeTelegramHtml(value) {
@@ -1590,15 +2127,20 @@ async function sendTelegram({ telegramToken, telegramChatId }, items) {
   const bullet = '\u2022'; // •
   const emDash = '\u2014'; // —
 
+  const inbox = '\uD83D\uDCE5'; // 📥
+  const clock = '\u23F0'; // ⏰
+  const person = '\uD83D\uDC64'; // 👤
+  const clipboard = '\uD83D\uDCCB'; // 📋
+
   const lines = [];
-  lines.push('<b>แจ้งเตือนการเบิกของ</b>');
+  lines.push(`${inbox} <b>แจ้งเตือนการเบิกของ</b>`);
   lines.push('<code>Inventory System</code>');
   lines.push(divider);
-  lines.push(`<b>เวลา</b>: ${escapeTelegramHtml(timeText)}`);
-  lines.push(`<b>ผู้เบิก</b>: ${escapeTelegramHtml(nameDisplay)}`);
-  lines.push(`<b>จำนวนรายการ</b>: ${escapeTelegramHtml(totalItems)}`);
+  lines.push(`${clock} <b>เวลา</b>: ${escapeTelegramHtml(timeText)}`);
+  lines.push(`${person} <b>ผู้เบิก</b>: ${escapeTelegramHtml(nameDisplay)}`);
+  lines.push(`${clipboard} <b>จำนวนรายการ</b>: ${escapeTelegramHtml(totalItems)}`);
   lines.push(divider);
-  lines.push('<b>รายการ</b>');
+  lines.push('\uD83D\uDCE6 <b>รายการ</b>');
 
   for (const d of items) {
     const itemName = escapeTelegramHtml((d?.item || '').toString().trim());
@@ -1615,6 +2157,33 @@ async function sendTelegram({ telegramToken, telegramChatId }, items) {
     text: message,
     parse_mode: 'HTML',
     disable_web_page_preview: true,
+  });
+
+  return {
+    skipped: false,
+    ok: true,
+    messageId: resp?.data?.result?.message_id ?? null,
+  };
+}
+
+async function sendTelegramHtmlMessage_({ telegramToken, telegramChatId }, htmlMessage) {
+  if (!telegramToken || !telegramChatId) {
+    return { skipped: true };
+  }
+
+  const message = (htmlMessage ?? '').toString();
+  if (!message.trim()) {
+    return { skipped: true, reason: 'empty-message' };
+  }
+
+  const axios = getAxios();
+  const resp = await axios.post(`https://api.telegram.org/bot${telegramToken}/sendMessage`, {
+    chat_id: telegramChatId,
+    text: message,
+    parse_mode: 'HTML',
+    disable_web_page_preview: true,
+  }, {
+    timeout: 15000,
   });
 
   return {
@@ -1684,12 +2253,16 @@ exports.recordData = onRequest({
 
       // Firestore: best-effort (ต้องไม่ทำให้การเขียน Google Sheet ล้ม)
       let firestoreResult = { ok: true };
+      let withdrawalId = null;
       try {
         if (isFunctionsEmulator() && !hasFirestoreEmulator()) {
           firestoreResult = { ok: false, skipped: true, message: 'Firestore emulator is not running' };
         } else {
           await upsertRequesterName(items[0]?.name);
-          await storeWithdrawal(items);
+          const w = await storeWithdrawal(items);
+          withdrawalId = w?.id || null;
+          const stock = await applyWithdrawalStockDeltas_(items);
+          firestoreResult = { ok: true, stock, withdrawalId };
         }
       } catch (e) {
         firestoreResult = { ok: false, message: formatFirestoreError(e) };
@@ -1697,7 +2270,7 @@ exports.recordData = onRequest({
       }
 
       // Google Sheet
-      await appendToSheet(settings, items);
+      const sheet = await appendToSheet(settings, items, { withdrawalId });
 
       // Telegram (optional)
       let telegramResult;
@@ -1719,6 +2292,7 @@ exports.recordData = onRequest({
         message: 'บันทึกข้อมูลสำเร็จ',
         telegram: telegramResult,
         firestore: firestoreResult,
+        sheet,
       });
     } catch (error) {
       console.error('Error in recordData:', error);
@@ -1726,6 +2300,111 @@ exports.recordData = onRequest({
         success: false,
         message: error?.message || 'เกิดข้อผิดพลาดภายในระบบ',
       });
+    }
+  });
+});
+
+// POST /api/deleteWithdrawal (hard delete 1 withdrawal batch)
+// Protected by SYNC_TOKEN via header x-sync-token
+exports.deleteWithdrawal = onRequest({
+  maxInstances: 1,
+  invoker: 'public',
+  secrets: [
+    SYNC_TOKEN_SECRET,
+    SPREADSHEET_ID_SECRET,
+    GOOGLE_CLIENT_EMAIL_SECRET,
+    GOOGLE_PRIVATE_KEY_SECRET,
+  ],
+}, async (req, res) => {
+  return cors(req, res, async () => {
+    try {
+      if (req.method === 'OPTIONS') {
+        res.status(204).send('');
+        return;
+      }
+
+      if (req.method !== 'POST') {
+        res.status(405).json({ success: false, message: 'Method Not Allowed' });
+        return;
+      }
+
+      if (!ensureSyncTokenAuthorized(req, res)) {
+        return;
+      }
+
+      const body = (typeof req.body === 'object' && req.body) ? req.body : {};
+      const withdrawalId = (body.withdrawalId ?? body.id ?? '').toString().trim();
+      if (!withdrawalId) {
+        res.status(400).json({ success: false, message: 'Missing withdrawalId' });
+        return;
+      }
+
+      if (isFunctionsEmulator() && !hasFirestoreEmulator()) {
+        res.status(400).json({ success: false, message: 'Firestore emulator is not running' });
+        return;
+      }
+
+      const wRef = getDb().collection('withdrawals').doc(withdrawalId);
+      const wSnap = await wRef.get();
+      if (!wSnap.exists) {
+        res.status(404).json({ success: false, message: 'ไม่พบรายการเบิกในระบบ (withdrawal ไม่อยู่แล้ว)' });
+        return;
+      }
+      const wData = wSnap.data() || {};
+      const createdAtIso = wData.createdAt && typeof wData.createdAt.toDate === 'function'
+        ? wData.createdAt.toDate().toISOString()
+        : null;
+
+      const withdrawal = {
+        id: wSnap.id,
+        name: wData.name || null,
+        createdAt: createdAtIso,
+        items: Array.isArray(wData.items) ? wData.items : [],
+      };
+
+      const settings = getRuntimeSettings();
+
+      // Preflight: find sheet rows to delete.
+      let found = await findRecieveFormRowsByWithdrawalId_(settings, withdrawalId);
+      let ambiguous = 0;
+      if (!found.rowNumbers || found.rowNumbers.length === 0) {
+        const fallback = await findRecieveFormRowsByContentFallback_(settings, withdrawal);
+        ambiguous = Number(fallback?.ambiguous || 0);
+        found = { sheetId: fallback.sheetId, rowNumbers: fallback.rowNumbers };
+      }
+      if (!found.rowNumbers || found.rowNumbers.length === 0) {
+        const msg = ambiguous > 1
+          ? 'ไม่สามารถระบุแถวในชีตได้แน่ชัด (ข้อมูลซ้ำ/คล้ายกันหลายชุด) กรุณาลบในชีตเอง'
+          : 'ไม่พบแถวในชีต RecieveForm ที่ตรงกับรายการนี้ กรุณาลบในชีตเอง';
+        res.status(409).json({
+          success: false,
+          message: msg,
+          withdrawalId,
+        });
+        return;
+      }
+
+      // 1) Restore stock + delete withdrawal doc in Firestore
+      const stockRestore = await applyRestoreStockDeltas_(withdrawal.items);
+      await wRef.delete();
+
+      // 2) Delete rows from sheet
+      const sheetDelete = await deleteRecieveFormRows_(settings, {
+        sheetId: found.sheetId,
+        rowNumbers: found.rowNumbers,
+      });
+
+      clearCachedResponses(['withdrawals:', 'withdrawalStats:', 'items:']);
+
+      res.status(200).json({
+        success: true,
+        withdrawalId,
+        restored: stockRestore,
+        sheet: sheetDelete,
+      });
+    } catch (error) {
+      console.error('Error in deleteWithdrawal:', error);
+      res.status(500).json({ success: false, message: error?.message || 'deleteWithdrawal failed' });
     }
   });
 });
@@ -1952,6 +2631,136 @@ exports.items = onRequest(async (req, res) => {
 
 // POST /api/addStock (เพิ่มจำนวนของเข้า stock โดยเขียนลงชีต AllstockV2 คอลัมน์ D)
 // Protected by SYNC_TOKEN via header x-sync-token
+async function updateAllstockV2IncomingQty_(settings, {
+  itemId,
+  displayName,
+  delta,
+}) {
+  const spreadsheetId = requireString(settings.spreadsheetId, 'SPREADSHEET_ID');
+  const sheets = await getSheetsClient_(settings, { readOnly: false });
+
+  const sheetName = 'AllstockV2';
+  const a1SheetName = `'${sheetName.replace(/'/g, "''")}'`;
+
+  const resp = await sheets.spreadsheets.values.get({
+    spreadsheetId,
+    range: `${a1SheetName}!A:M`,
+    majorDimension: 'ROWS',
+    valueRenderOption: 'UNFORMATTED_VALUE',
+  });
+  const rows = Array.isArray(resp?.data?.values) ? resp.data.values : [];
+  if (rows.length === 0) {
+    throw new Error('AllstockV2: no rows returned');
+  }
+
+  // Identify header row and skip it.
+  let headerRowIndex0 = -1;
+  for (let r = 0; r < Math.min(rows.length, 10); r++) {
+    const row = rows[r] || [];
+    const foundItem = row.findIndex((c) => (c ?? '').toString().trim() === SHEET_HEADER_ITEM);
+    if (foundItem >= 0) {
+      headerRowIndex0 = r;
+      break;
+    }
+  }
+
+  const itemIdText = (itemId || '').toString().trim();
+  const nameText = (displayName || '').toString().trim().replace(/\s+/g, ' ');
+
+  const itemNameCol = 2; // C
+  const incomingCol = 3; // D
+  const itemIdCol = 12; // M
+
+  let targetRowIndex = -1;
+  let matchedBy = null;
+
+  if (itemIdText) {
+    for (let r = 0; r < rows.length; r++) {
+      if (headerRowIndex0 >= 0 && r === headerRowIndex0) continue;
+      const row = rows[r] || [];
+      const rowId = (row[itemIdCol] ?? '').toString().trim();
+      const anyCellIdMatch = row.some((c) => (c ?? '').toString().trim() === itemIdText);
+      if ((rowId && rowId === itemIdText) || anyCellIdMatch) {
+        targetRowIndex = r;
+        matchedBy = 'itemId';
+        break;
+      }
+    }
+  }
+
+  if (targetRowIndex < 0 && nameText) {
+    for (let r = 0; r < rows.length; r++) {
+      if (headerRowIndex0 >= 0 && r === headerRowIndex0) continue;
+      const row = rows[r] || [];
+      const rowName = (row[itemNameCol] ?? '').toString().trim().replace(/\s+/g, ' ');
+      if (rowName && rowName === nameText) {
+        targetRowIndex = r;
+        matchedBy = 'displayName';
+        break;
+      }
+    }
+  }
+
+  if (targetRowIndex < 0) {
+    throw new Error('AllstockV2: item not found');
+  }
+
+  const row = rows[targetRowIndex] || [];
+  const existingIncoming = (row[incomingCol] === '' || row[incomingCol] == null)
+    ? 0
+    : (Number.isFinite(Number(row[incomingCol])) ? Number(row[incomingCol]) : 0);
+
+  const deltaNumber = Number(delta);
+  if (!Number.isFinite(deltaNumber) || deltaNumber === 0) {
+    throw new Error('AllstockV2: invalid delta');
+  }
+
+  const newIncoming = existingIncoming + deltaNumber;
+  if (newIncoming < 0) {
+    throw new Error('AllstockV2: resulting incomingQty would be negative');
+  }
+
+  const targetRowNumber = targetRowIndex + 1;
+  // Backfill itemId into column M so the sheet has stable IDs
+  // even for legacy rows that were created before we wrote itemId.
+  try {
+    if (itemIdText) {
+      const existingIdText = (row[itemIdCol] ?? '').toString().trim();
+      if (!existingIdText || existingIdText !== itemIdText) {
+        await sheets.spreadsheets.values.update({
+          spreadsheetId,
+          range: `${a1SheetName}!M${targetRowNumber}`,
+          valueInputOption: 'USER_ENTERED',
+          requestBody: { values: [[itemIdText]] },
+        });
+      }
+    }
+  } catch (e) {
+    console.warn('AllstockV2: itemId backfill failed (non-fatal)', {
+      rowNumber: targetRowNumber,
+      message: e?.message || null,
+      status: e?.response?.status ?? null,
+    });
+  }
+
+  await sheets.spreadsheets.values.update({
+    spreadsheetId,
+    range: `${a1SheetName}!D${targetRowNumber}`,
+    valueInputOption: 'USER_ENTERED',
+    requestBody: { values: [[newIncoming]] },
+  });
+
+  return {
+    ok: true,
+    sheet: sheetName,
+    rowNumber: targetRowNumber,
+    matchedBy,
+    previousIncoming: existingIncoming,
+    newIncoming,
+    delta: deltaNumber,
+  };
+}
+
 async function runDirectStockAdjustment({ req, res, type }) {
   if (!ensureSyncTokenAuthorized(req, res)) {
     return;
@@ -1959,6 +2768,7 @@ async function runDirectStockAdjustment({ req, res, type }) {
 
   const body = (typeof req.body === 'object' && req.body) ? req.body : {};
   const itemName = (body.item ?? body.displayName ?? '').toString().trim().replace(/\s+/g, ' ');
+  const requesterName = (body.name ?? body.requesterName ?? '').toString().trim().replace(/\s+/g, ' ');
   const qty = Number(body.quantity);
 
   if (!itemName) {
@@ -1971,48 +2781,111 @@ async function runDirectStockAdjustment({ req, res, type }) {
   }
 
   const searchKey = normalizeItemKey(itemName);
-  const adjRef = getDb().collection('stockAdjustments').doc();
-  const payload = {
-    type,
-    displayName: itemName,
-    searchKey,
-    quantity: qty,
-    status: 'processing',
-    source: 'dashboard-direct',
-    createdAt: admin.firestore.FieldValue.serverTimestamp(),
-  };
-  await adjRef.set(payload, { merge: true });
+  if (!searchKey) {
+    res.status(400).json({ success: false, message: 'Invalid item' });
+    return;
+  }
 
-  const outcome = await processSingleStockAdjustment({ ref: adjRef, data: payload });
-  if (!outcome?.ok) {
-    res.status(400).json({
-      success: false,
-      message: outcome?.reason || 'Stock adjustment failed',
-    });
+  const action = (type || 'add').toString().trim().toLowerCase();
+  const isRemove = action === 'remove' || action === 'sub' || action === 'subtract';
+  const delta = isRemove ? -qty : qty;
+  if (!Number.isFinite(delta) || delta === 0) {
+    res.status(400).json({ success: false, message: 'Invalid quantity delta' });
     return;
   }
 
   const stockDocId = itemDocIdFromKey(searchKey);
-  const stockSnap = await getDb().collection('stockItems').doc(stockDocId).get();
-  const stockData = stockSnap.exists ? (stockSnap.data() || {}) : {};
-  const item = {
-    displayName: stockData.displayName || itemName,
-    remainingQty: (typeof stockData.remainingQty === 'number' && Number.isFinite(stockData.remainingQty)) ? stockData.remainingQty : null,
-    unit: stockData.unit || null,
-    lowStockThreshold: (typeof stockData.lowStockThreshold === 'number') ? stockData.lowStockThreshold : null,
-  };
+  const ref = getDb().collection('stockItems').doc(stockDocId);
+  const now = admin.firestore.FieldValue.serverTimestamp();
+  let previousRemaining = null;
+  let newRemaining = null;
 
-  clearCachedResponses(['items:']);
+  try {
+    await getDb().runTransaction(async (tx) => {
+      const snap = await tx.get(ref);
+      if (!snap.exists) {
+        throw new Error('ไม่พบรายการในระบบ');
+      }
+      const data = snap.data() || {};
+      const cur = (typeof data.remainingQty === 'number' && Number.isFinite(data.remainingQty)) ? data.remainingQty : 0;
+      const next = cur + delta;
+      if (!Number.isFinite(next) || next < 0) {
+        throw new Error('จำนวนคงเหลือติดลบ');
+      }
 
-  res.status(200).json({
-    success: true,
-    queued: false,
-    adjustmentId: adjRef.id,
-    item,
-  });
+      previousRemaining = cur;
+      newRemaining = next;
+
+      tx.set(ref, {
+        remainingQty: next,
+        updatedAt: now,
+        stockUpdatedAt: now,
+        stockUpdatedSource: isRemove ? 'dashboard-direct-remove' : 'dashboard-direct-add',
+      }, { merge: true });
+    });
+
+    const stockSnap = await ref.get();
+    const stockData = stockSnap.exists ? (stockSnap.data() || {}) : {};
+
+    const item = {
+      displayName: stockData.displayName || itemName,
+      remainingQty: (typeof stockData.remainingQty === 'number' && Number.isFinite(stockData.remainingQty)) ? stockData.remainingQty : newRemaining,
+      unit: stockData.unit || null,
+      lowStockThreshold: (typeof stockData.lowStockThreshold === 'number') ? stockData.lowStockThreshold : null,
+    };
+
+    const settings = getRuntimeSettings();
+    // Direct stock adjustments from dashboard should update AllstockV2 incoming (col D)
+    // because AllstockV2 remaining formula is based on: remaining = incoming(D) - withdrawals(RecieveForm).
+    // Writing to RecieveForm here would double-count the reduction.
+    const sheet = await updateAllstockV2IncomingQty_(settings, {
+      itemId: stockDocId,
+      displayName: item.displayName,
+      delta,
+    });
+
+    clearCachedResponses(['items:']);
+
+    res.status(200).json({
+      success: true,
+      queued: false,
+      type: isRemove ? 'remove' : 'add',
+      delta,
+      item,
+      sheet,
+    });
+    return;
+  } catch (e) {
+    // Best-effort rollback if sheet update fails after Firestore update.
+    // Only rollback if the current value matches what we just wrote.
+    try {
+      if (previousRemaining != null && newRemaining != null) {
+        await getDb().runTransaction(async (tx) => {
+          const snap = await tx.get(ref);
+          if (!snap.exists) return;
+          const data = snap.data() || {};
+          const cur = (typeof data.remainingQty === 'number' && Number.isFinite(data.remainingQty)) ? data.remainingQty : null;
+          if (cur === newRemaining) {
+            tx.set(ref, {
+              remainingQty: previousRemaining,
+              updatedAt: now,
+              stockUpdatedAt: now,
+              stockUpdatedSource: 'dashboard-direct-rollback',
+            }, { merge: true });
+          }
+        });
+      }
+    } catch {}
+
+    res.status(400).json({
+      success: false,
+      message: e?.message || 'Stock adjustment failed',
+    });
+    return;
+  }
 }
 
-// POST /api/addStock (update sheet directly)
+// POST /api/addStock (update sheet directly: AllstockV2 incoming col D += quantity)
 // Protected by SYNC_TOKEN via header x-sync-token
 exports.addStock = onRequest({
   maxInstances: 1,
@@ -2045,7 +2918,7 @@ exports.addStock = onRequest({
   });
 });
 
-// POST /api/removeStock (update sheet directly)
+// POST /api/removeStock (update sheet directly: AllstockV2 incoming col D -= quantity)
 // Protected by SYNC_TOKEN via header x-sync-token
 exports.removeStock = onRequest({
   maxInstances: 1,
@@ -2078,200 +2951,9 @@ exports.removeStock = onRequest({
   });
 });
 
-// Background: process stockAdjustments by syncing to Google Sheet (Column D) then reconciling Firestore.
-async function processSingleStockAdjustment({ ref, data }) {
-  const searchKey = (data.searchKey || '').toString().trim();
-  const displayName = (data.displayName || '').toString().trim().replace(/\s+/g, ' ');
-  const qty = Number(data.quantity);
-  const action = (data.type || 'add').toString().trim().toLowerCase();
-  const isRemove = action === 'remove' || action === 'sub' || action === 'subtract';
-  if (!searchKey || !displayName || !Number.isFinite(qty) || qty <= 0) {
-    await ref.set({ status: 'error', error: 'Invalid adjustment payload', processedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
-    return { ok: false, reason: 'invalid' };
-  }
-  if (!['add', 'remove', 'sub', 'subtract'].includes(action)) {
-    await ref.set({ status: 'error', error: 'Invalid adjustment type', processedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
-    return { ok: false, reason: 'invalid-type' };
-  }
-
-  const settings = getRuntimeSettings();
-  const google = getGoogle();
-  const auth = new google.auth.GoogleAuth({
-    credentials: {
-      client_email: requireString(settings.googleClientEmail, 'GOOGLE_CLIENT_EMAIL'),
-      private_key: requireString(settings.googlePrivateKey, 'GOOGLE_PRIVATE_KEY'),
-    },
-    scopes: ['https://www.googleapis.com/auth/spreadsheets'],
-  });
-  const sheets = google.sheets({ version: 'v4', auth });
-
-  const spreadsheetId = requireString(settings.spreadsheetId, 'SPREADSHEET_ID');
-  const sheetName = 'AllstockV2';
-  const a1SheetName = `'${sheetName.replace(/'/g, "''")}'`;
-
-  const resp = await sheets.spreadsheets.values.get({
-    spreadsheetId,
-    range: `${a1SheetName}!A:Z`,
-    majorDimension: 'ROWS',
-    valueRenderOption: 'UNFORMATTED_VALUE',
-  });
-
-  const rows = Array.isArray(resp?.data?.values) ? resp.data.values : [];
-  if (rows.length === 0) {
-    await ref.set({ status: 'error', error: 'No rows returned from sheet', processedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
-    return { ok: false, reason: 'no-rows' };
-  }
-
-  const headerNeedle = SHEET_HEADER_ITEM;
-  const remainNeedle = SHEET_HEADER_REMAINING;
-  const unitNeedle = SHEET_HEADER_UNIT;
-  let headerRowIndex = 0;
-  let itemCol = -1;
-  let remainingCol = -1;
-  let unitCol = -1;
-
-  for (let r = 0; r < Math.min(rows.length, 10); r++) {
-    const row = rows[r] || [];
-    const foundItem = row.findIndex((c) => (c ?? '').toString().trim() === headerNeedle);
-    if (foundItem >= 0) {
-      headerRowIndex = r;
-      itemCol = foundItem;
-      remainingCol = row.findIndex((c) => (c ?? '').toString().trim() === remainNeedle);
-      unitCol = row.findIndex((c) => (c ?? '').toString().trim() === unitNeedle);
-      break;
-    }
-  }
-
-  if (itemCol < 0) itemCol = 2;
-  if (remainingCol < 0) remainingCol = 4;
-  if (unitCol < 0) unitCol = 5;
-
-  const incomingCol = 3; // D
-  const lowCol = 10; // K
-
-  let targetRowIndex = -1;
-  for (let r = headerRowIndex + 1; r < rows.length; r++) {
-    const row = rows[r] || [];
-    const name = (row[itemCol] ?? '').toString().trim().replace(/\s+/g, ' ');
-    if (!name) continue;
-    if (normalizeItemKey(name) === searchKey) {
-      targetRowIndex = r;
-      break;
-    }
-  }
-
-  if (targetRowIndex < 0) {
-    await ref.set({ status: 'error', error: 'Item not found in sheet', processedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
-    return { ok: false, reason: 'not-found-sheet' };
-  }
-
-  const targetRowNumber = targetRowIndex + 1;
-  const row = rows[targetRowIndex] || [];
-  const existingIncoming = (row[incomingCol] === '' || row[incomingCol] == null)
-    ? 0
-    : (Number.isFinite(Number(row[incomingCol])) ? Number(row[incomingCol]) : 0);
-  const delta = isRemove ? -qty : qty;
-  const newIncoming = existingIncoming + delta;
-  if (newIncoming < 0) {
-    await ref.set({
-      status: 'error',
-      error: 'Resulting stock would be negative',
-      processedAt: admin.firestore.FieldValue.serverTimestamp(),
-    }, { merge: true });
-    return { ok: false, reason: 'negative-stock' };
-  }
-
-  await sheets.spreadsheets.values.update({
-    spreadsheetId,
-    range: `${a1SheetName}!D${targetRowNumber}`,
-    valueInputOption: 'USER_ENTERED',
-    requestBody: { values: [[newIncoming]] },
-  });
-
-  // Re-read updated row to reconcile remainingQty (E)
-  const rowResp = await sheets.spreadsheets.values.get({
-    spreadsheetId,
-    range: `${a1SheetName}!A${targetRowNumber}:Z${targetRowNumber}`,
-    majorDimension: 'ROWS',
-    valueRenderOption: 'UNFORMATTED_VALUE',
-  });
-  const updatedRow = (Array.isArray(rowResp?.data?.values) && rowResp.data.values[0]) ? rowResp.data.values[0] : [];
-
-  const outDisplayName = (updatedRow[itemCol] ?? '').toString().trim().replace(/\s+/g, ' ');
-  const remainingRaw = updatedRow[remainingCol];
-  const remainingQty = (remainingRaw === '' || remainingRaw == null)
-    ? null
-    : (Number.isFinite(Number(remainingRaw)) ? Number(remainingRaw) : null);
-  const unit = (updatedRow[unitCol] ?? '').toString().trim().replace(/\s+/g, ' ');
-  const lowRaw = updatedRow[lowCol];
-  const lowStockThreshold = (lowRaw === '' || lowRaw == null)
-    ? null
-    : (Number.isFinite(Number(lowRaw)) ? Number(lowRaw) : null);
-
-  await upsertStockItems([{ displayName: outDisplayName || displayName, remainingQty, unit: unit || null, lowStockThreshold }]);
-
-  await ref.set({
-    status: 'done',
-    processedAt: admin.firestore.FieldValue.serverTimestamp(),
-    sheet: {
-      sheet: sheetName,
-      rowNumber: targetRowNumber,
-      incomingCol: 'D',
-      action: isRemove ? 'remove' : 'add',
-      delta,
-      previousIncoming: existingIncoming,
-      newIncoming,
-    },
-  }, { merge: true });
-
-  return { ok: true, rowNumber: targetRowNumber, newIncoming };
-}
-
-exports.processStockAdjustments = onDocumentCreated({
-  document: 'stockAdjustments/{id}',
-  maxInstances: 1,
-  secrets: [
-    SPREADSHEET_ID_SECRET,
-    GOOGLE_CLIENT_EMAIL_SECRET,
-    GOOGLE_PRIVATE_KEY_SECRET,
-  ],
-}, async (event) => {
-  const snap = event.data;
-  if (!snap) return;
-  const id = event.params?.id || snap.id;
-
-  const data = snap.data() || {};
-  if ((data.status || '').toString() === 'done') return;
-
-  const ref = snap.ref;
-  // Claim the job
-  try {
-    await getDb().runTransaction(async (tx) => {
-      const cur = await tx.get(ref);
-      if (!cur.exists) return;
-      const curData = cur.data() || {};
-      const st = (curData.status || '').toString();
-      if (st && st !== 'pending') return;
-      tx.set(ref, {
-        status: 'processing',
-        processingAt: admin.firestore.FieldValue.serverTimestamp(),
-      }, { merge: true });
-    });
-  } catch (e) {
-    // If we can't claim, skip.
-    return;
-  }
-
-  try {
-    await processSingleStockAdjustment({ ref, data });
-  } catch (e) {
-    await ref.set({ status: 'error', error: e?.message || 'processStockAdjustments failed', processedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
-  }
-});
-
-// HTTP fallback: process pending adjustments in batches (for environments where Eventarc trigger can't be deployed yet).
+// POST /api/createItem (create new master item in both Firestore + AllstockV2)
 // Protected by SYNC_TOKEN via header x-sync-token
-exports.processStockAdjustmentsHttp = onRequest({
+exports.createItem = onRequest({
   maxInstances: 1,
   invoker: 'public',
   secrets: [
@@ -2298,58 +2980,159 @@ exports.processStockAdjustmentsHttp = onRequest({
       }
 
       const body = (typeof req.body === 'object' && req.body) ? req.body : {};
-      const maxParam = Number(body.max ?? req.query.max);
-      const maxToProcess = (Number.isFinite(maxParam) && maxParam > 0) ? Math.min(Math.floor(maxParam), 20) : 5;
+      const displayName = (body.displayName ?? body.item ?? body.name ?? '').toString().trim().replace(/\s+/g, ' ');
+      const incomingQty = Number(body.incomingQty ?? body.stockQty ?? body.quantity ?? body.inStock ?? body.incoming);
+      const unit = (body.unit ?? '').toString().trim().replace(/\s+/g, ' ');
+      const note = (body.note ?? body.remark ?? '').toString().trim();
 
-      const pendingSnap = await getDb()
-        .collection('stockAdjustments')
-        .where('status', '==', 'pending')
-        .limit(maxToProcess)
-        .get();
-
-      const processed = [];
-      const skipped = [];
-
-      for (const doc of pendingSnap.docs) {
-        const ref = doc.ref;
-        const data = doc.data() || {};
-
-        let claimed = false;
-        try {
-          await getDb().runTransaction(async (tx) => {
-            const cur = await tx.get(ref);
-            if (!cur.exists) return;
-            const curData = cur.data() || {};
-            const st = (curData.status || '').toString();
-            if (st !== 'pending') return;
-            tx.set(ref, {
-              status: 'processing',
-              processingAt: admin.firestore.FieldValue.serverTimestamp(),
-            }, { merge: true });
-            claimed = true;
-          });
-        } catch {
-          claimed = false;
-        }
-
-        if (!claimed) {
-          skipped.push({ id: doc.id, reason: 'not-claimed' });
-          continue;
-        }
-
-        try {
-          const r = await processSingleStockAdjustment({ ref, data });
-          processed.push({ id: doc.id, ok: !!r?.ok });
-        } catch (e) {
-          await ref.set({ status: 'error', error: e?.message || 'processStockAdjustmentsHttp failed', processedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
-          processed.push({ id: doc.id, ok: false });
-        }
+      if (!displayName) {
+        res.status(400).json({ success: false, message: 'Missing displayName' });
+        return;
+      }
+      if (!Number.isFinite(incomingQty) || incomingQty < 0) {
+        res.status(400).json({ success: false, message: 'Invalid incomingQty' });
+        return;
+      }
+      if (!unit) {
+        res.status(400).json({ success: false, message: 'Missing unit' });
+        return;
       }
 
-      res.status(200).json({ success: true, processedCount: processed.length, processed, skippedCount: skipped.length, skipped });
+      const searchKey = normalizeItemKey(displayName);
+      if (!searchKey) {
+        res.status(400).json({ success: false, message: 'Invalid displayName' });
+        return;
+      }
+
+      const docId = itemDocIdFromKey(searchKey);
+      const ref = getDb().collection('stockItems').doc(docId);
+      const existing = await ref.get();
+      if (existing.exists) {
+        res.status(409).json({ success: false, message: 'รายการนี้มีอยู่แล้วในระบบ' });
+        return;
+      }
+
+      const now = admin.firestore.FieldValue.serverTimestamp();
+
+      // Create in Firestore first, then write to sheet. Rollback Firestore if sheet fails.
+      await ref.set({
+        displayName,
+        searchKey,
+        remainingQty: incomingQty,
+        unit: unit || null,
+        note: note || null,
+        createdAt: now,
+        updatedAt: now,
+        createdSource: 'dashboard-createItem',
+      }, { merge: true });
+
+      try {
+        const settings = getRuntimeSettings();
+        const sheet = await appendStockItemToAllstockSheet_(settings, {
+          displayName,
+          incomingQty,
+          unit,
+          note,
+          itemId: docId,
+        });
+
+        clearCachedResponses(['items:']);
+        res.status(200).json({
+          success: true,
+          item: { displayName, remainingQty: incomingQty, unit, note: note || null, itemId: docId },
+          sheet,
+        });
+      } catch (e) {
+        // Best-effort rollback
+        try { await ref.delete(); } catch {}
+        throw e;
+      }
     } catch (error) {
-      console.error('Error in processStockAdjustmentsHttp:', error);
-      res.status(500).json({ success: false, message: error?.message || 'processStockAdjustmentsHttp failed' });
+      console.error('Error in createItem:', error);
+      res.status(500).json({
+        success: false,
+        message: error?.message || 'createItem failed',
+      });
+    }
+  });
+});
+
+// POST /api/deleteItem (hard delete master item from both Firestore + AllstockV2)
+// Protected by SYNC_TOKEN via header x-sync-token
+exports.deleteItem = onRequest({
+  maxInstances: 1,
+  invoker: 'public',
+  secrets: [
+    SYNC_TOKEN_SECRET,
+    SPREADSHEET_ID_SECRET,
+    GOOGLE_CLIENT_EMAIL_SECRET,
+    GOOGLE_PRIVATE_KEY_SECRET,
+  ],
+}, async (req, res) => {
+  return cors(req, res, async () => {
+    try {
+      if (req.method === 'OPTIONS') {
+        res.status(204).send('');
+        return;
+      }
+
+      if (req.method !== 'POST') {
+        res.status(405).json({ success: false, message: 'Method Not Allowed' });
+        return;
+      }
+
+      if (!ensureSyncTokenAuthorized(req, res)) {
+        return;
+      }
+
+      const body = (typeof req.body === 'object' && req.body) ? req.body : {};
+      const displayName = (body.displayName ?? body.item ?? body.name ?? '').toString().trim().replace(/\s+/g, ' ');
+      const itemId = (body.itemId ?? body.docId ?? '').toString().trim();
+
+      if (!displayName && !itemId) {
+        res.status(400).json({ success: false, message: 'Missing displayName or itemId' });
+        return;
+      }
+
+      const resolvedDocId = itemId || itemDocIdFromKey(normalizeItemKey(displayName));
+      const settings = getRuntimeSettings();
+
+      // Delete from sheet first (so formulas stop affecting remaining immediately).
+      let sheet;
+      try {
+        sheet = await deleteStockItemFromAllstockSheet_(settings, {
+          itemId: resolvedDocId,
+          displayName,
+        });
+      } catch (e) {
+        const msg = (e?.message || '').toString();
+        if (msg.includes('AllstockV2: item not found')) {
+          res.status(409).json({
+            success: false,
+            message: 'ไม่พบแถวในชีต AllstockV2 ของรายการนี้ (อาจเคยบันทึกผิดคอลัมน์/ถูกย้าย) กรุณาลบในชีตเอง แล้วค่อยลบในระบบอีกครั้ง',
+            itemId: resolvedDocId,
+          });
+          return;
+        }
+        throw e;
+      }
+
+      // Delete Firestore doc
+      await getDb().collection('stockItems').doc(resolvedDocId).delete();
+      clearCachedResponses(['items:']);
+
+      res.status(200).json({
+        success: true,
+        itemId: resolvedDocId,
+        displayName: displayName || null,
+        sheet,
+      });
+    } catch (error) {
+      console.error('Error in deleteItem:', error);
+      res.status(500).json({
+        success: false,
+        message: error?.message || 'deleteItem failed',
+      });
     }
   });
 });
@@ -2577,86 +3360,6 @@ exports.outOfStock = onRequest(async (req, res) => {
         success: true,
         items: [],
         warning: formatFirestoreError(error),
-      });
-    }
-  });
-});
-
-// POST /api/syncItems (ดึงรายการจากชีต AllstockV2 แล้วเก็บลง Firestore)
-exports.syncItems = onRequest({
-  secrets: [
-    SYNC_TOKEN_SECRET,
-    SPREADSHEET_ID_SECRET,
-    GOOGLE_CLIENT_EMAIL_SECRET,
-    GOOGLE_PRIVATE_KEY_SECRET,
-  ],
-}, async (req, res) => {
-  return cors(req, res, async () => {
-    try {
-      if (req.method === 'OPTIONS') {
-        res.status(204).send('');
-        return;
-      }
-
-      if (req.method !== 'POST') {
-        res.status(405).json({ success: false, message: 'Method Not Allowed' });
-        return;
-      }
-
-      if (!ensureSyncTokenAuthorized(req, res)) {
-        return;
-      }
-
-      const settings = getRuntimeSettings();
-      const fetched = await fetchStockItemsFromSheet(settings);
-
-      const withRemainingCount = fetched.items.filter((it) => typeof it.remainingQty === 'number').length;
-      const outOfStockCount = fetched.items.filter((it) => it.remainingQty === 0).length;
-      const sampleOutOfStock = fetched.items
-        .filter((it) => it.remainingQty === 0)
-        .slice(0, 10)
-        .map((it) => it.displayName);
-
-      try {
-        const result = await upsertStockItems(fetched.items);
-        res.status(200).json({
-          success: true,
-          synced: result.total,
-          written: result.written,
-          skipped: result.skipped,
-          sheet: 'AllstockV2',
-          columnHeader: SHEET_HEADER_ITEM,
-          headerRowIndex: fetched.headerRowIndex,
-          colIndex: fetched.colIndex,
-          remainingColIndex: fetched.remainingColIndex,
-          unitColIndex: fetched.unitColIndex,
-          withRemainingCount,
-          outOfStockCount,
-          sampleOutOfStock,
-          sample: fetched.items.slice(0, 10),
-        });
-      } catch (e) {
-        res.status(500).json({
-          success: false,
-          message: formatFirestoreError(e),
-          fetched: fetched.items.length,
-          sheet: 'AllstockV2',
-          columnHeader: SHEET_HEADER_ITEM,
-          headerRowIndex: fetched.headerRowIndex,
-          colIndex: fetched.colIndex,
-          remainingColIndex: fetched.remainingColIndex,
-          unitColIndex: fetched.unitColIndex,
-          withRemainingCount,
-          outOfStockCount,
-          sampleOutOfStock,
-          sample: fetched.items.slice(0, 10),
-        });
-      }
-    } catch (error) {
-      console.error('Error in syncItems:', error);
-      res.status(500).json({
-        success: false,
-        message: error?.message || 'Sync failed',
       });
     }
   });
@@ -3063,7 +3766,7 @@ exports.recieveForm = onRequest({
 
       const resp = await sheets.spreadsheets.values.get({
         spreadsheetId,
-        range: `${a1SheetName}!A3:E`,
+        range: `${a1SheetName}!A3:F`,
         majorDimension: 'ROWS',
         valueRenderOption: 'UNFORMATTED_VALUE',
       });
@@ -3079,9 +3782,11 @@ exports.recieveForm = onRequest({
           const qtyRaw = row[3];
           const quantity = (qtyRaw === '' || qtyRaw == null) ? null : (Number.isFinite(Number(qtyRaw)) ? Number(qtyRaw) : (qtyRaw ?? null));
           const unit = (row[4] ?? '').toString().trim().replace(/\s+/g, ' ');
+          // Column F (1-based) => index 5 (0-based)
+          const withdrawalId = (row[5] ?? '').toString().trim();
           const isEmpty = (!ts && !name && !item && (quantity === null || quantity === '') && !unit);
           if (isEmpty) return null;
-          return { timestamp: ts ?? null, name: name || null, item: item || null, quantity, unit: unit || null };
+          return { timestamp: ts ?? null, name: name || null, item: item || null, quantity, unit: unit || null, withdrawalId: withdrawalId || null };
         })
         .filter(Boolean);
 

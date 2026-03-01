@@ -40,6 +40,10 @@
         "function": "withdrawals"
       },
       {
+        "source": "/api/deleteWithdrawal",
+        "function": "deleteWithdrawal"
+      },
+      {
         "source": "/api/withdrawalStats",
         "function": "withdrawalStats"
       },
@@ -60,8 +64,12 @@
         "function": "removeStock"
       },
       {
-        "source": "/api/processStockAdjustments",
-        "function": "processStockAdjustmentsHttp"
+        "source": "/api/createItem",
+        "function": "createItem"
+      },
+      {
+        "source": "/api/deleteItem",
+        "function": "deleteItem"
       },
       {
         "source": "/api/recieveForm",
@@ -70,6 +78,10 @@
       {
         "source": "/api/sendMonthlyWithdrawalsReport",
         "function": "sendMonthlyWithdrawalsReport"
+      },
+      {
+        "source": "/api/sendStockAlertsTelegramNow",
+        "function": "sendStockAlertsTelegramNow"
       },
       {
         "source": "/api/outOfStock",
@@ -90,10 +102,6 @@
       {
         "source": "/api/telegramMe",
         "function": "telegramMe"
-      },
-      {
-        "source": "/api/syncItems",
-        "function": "syncItems"
       },
       {
         "source": "/api/sheetStatus",

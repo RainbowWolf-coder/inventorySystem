@@ -21,6 +21,41 @@ const lookupCache = {
 
 let combinedLookupsPromise = null;
 
+function normalizeUnitValue(raw) {
+  return (raw ?? '')
+    .toString()
+    .replace(/^\uFEFF/, '')
+    .trim()
+    .replace(/\s+/g, ' ');
+}
+
+function updateUnitSelectFromItemRows(rows) {
+  const select = document.getElementById('inputUnit');
+  if (!select) return;
+
+  const existing = new Set(
+    Array.from(select.options)
+      .map((o) => normalizeUnitValue(o.value))
+      .filter((v) => v !== '')
+  );
+
+  const discovered = new Set();
+  for (const r of (Array.isArray(rows) ? rows : [])) {
+    const u = normalizeUnitValue(r?.unit);
+    if (u) discovered.add(u);
+  }
+
+  // Append missing units (preserve existing option order).
+  for (const u of Array.from(discovered.values()).sort((a, b) => a.localeCompare(b, 'th', { sensitivity: 'base' }))) {
+    if (existing.has(u)) continue;
+    const opt = document.createElement('option');
+    opt.value = u;
+    opt.textContent = u;
+    select.appendChild(opt);
+    existing.add(u);
+  }
+}
+
 function normalizeLookupKey(raw) {
   return (raw || '')
     .toString()
@@ -94,6 +129,9 @@ async function preloadItems({ force } = {}) {
         .filter((it) => it.displayName.trim() !== '');
       entry.rows = rows;
       entry.loadedAt = Date.now();
+
+      // เติมหน่วยจากข้อมูลจริงใน Firestore เข้า dropdown (เพิ่มจากตัวเลือกเดิม)
+      updateUnitSelectFromItemRows(entry.rows);
       return entry.rows;
     } finally {
       entry.loading = false;
@@ -164,6 +202,9 @@ async function preloadLookupsCombined({ force } = {}) {
         .map((it) => ({ ...it, key: normalizeLookupKey(it.displayName) }))
         .filter((it) => it.displayName.trim() !== '');
       lookupCache.items.loadedAt = Date.now();
+
+      // เติมหน่วยจากข้อมูลจริงใน Firestore เข้า dropdown (เพิ่มจากตัวเลือกเดิม)
+      updateUnitSelectFromItemRows(lookupCache.items.rows);
 
       return { ok: true, source: 'lookups' };
     } finally {

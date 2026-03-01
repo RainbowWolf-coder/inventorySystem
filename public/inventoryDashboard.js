@@ -6,6 +6,8 @@ let chartInstance = null;
 let refreshPromise = null;
 let autoRefreshTimer = null;
 
+let recentWithdrawals = [];
+
 let _pdfFontBase64 = null;
 
 function arrayBufferToBase64(buffer) {
@@ -232,8 +234,223 @@ async function removeStockForItem(displayName) {
 	}
 }
 
+function generateConfirmCode5Digits_() {
+  const n = Math.floor(10000 + Math.random() * 90000);
+  return String(n);
+}
+
+async function createItemFromDashboard() {
+	try {
+		ensureSwal();
+		const token = await ensureAdminToken();
+		if (!token) return;
+
+		const r = await Swal.fire({
+			title: 'เพิ่มรายการใหม่',
+			html: `
+			<div class="text-start">
+				<label class="form-label">รายการ</label>
+				<input id="swalItemName" class="form-control" placeholder="เช่น ถุงมือ" />
+				<div class="row g-2 mt-2">
+					<div class="col-6">
+						<label class="form-label">คงคลัง (D)</label>
+						<input id="swalIncomingQty" class="form-control" type="number" min="0" step="1" value="0" />
+					</div>
+					<div class="col-6">
+						<label class="form-label">หน่วย</label>
+						<input id="swalUnit" class="form-control" placeholder="เช่น กล่อง" />
+					</div>
+				</div>
+				<label class="form-label mt-2">หมายเหตุ (ถ้ามี)</label>
+				<input id="swalNote" class="form-control" placeholder="-" />
+				<div class="form-text mt-2">ระบบจะตั้งสูตรคงเหลือ (E) อัตโนมัติจาก RecieveForm และจะใส่ itemId ที่คอลัมน์ M</div>
+			</div>
+			`,
+			showCancelButton: true,
+			confirmButtonText: 'เพิ่มรายการ',
+			cancelButtonText: 'ยกเลิก',
+			focusConfirm: false,
+			preConfirm: () => {
+				const name = document.getElementById('swalItemName')?.value || '';
+				const incomingQty = document.getElementById('swalIncomingQty')?.value;
+				const unit = document.getElementById('swalUnit')?.value || '';
+				const note = document.getElementById('swalNote')?.value || '';
+				const cleanedName = name.toString().trim().replace(/\s+/g, ' ');
+				const qtyNum = Number(incomingQty);
+				const cleanedUnit = unit.toString().trim().replace(/\s+/g, ' ');
+				if (!cleanedName) {
+					Swal.showValidationMessage('กรุณากรอกชื่อรายการ');
+					return;
+				}
+				if (!Number.isFinite(qtyNum) || qtyNum < 0) {
+					Swal.showValidationMessage('คงคลังต้องเป็นเลข >= 0');
+					return;
+				}
+				if (!cleanedUnit) {
+					Swal.showValidationMessage('กรุณากรอกหน่วย');
+					return;
+				}
+				return { displayName: cleanedName, incomingQty: qtyNum, unit: cleanedUnit, note: note.toString().trim() };
+			},
+		});
+
+		if (!r.isConfirmed || !r.value) return;
+
+		Swal.fire({
+			title: 'กำลังบันทึก...',
+			allowOutsideClick: false,
+			allowEscapeKey: false,
+			didOpen: () => Swal.showLoading(),
+		});
+
+		const res = await fetch('/api/createItem', {
+			method: 'POST',
+			headers: {
+				'Content-Type': 'application/json',
+				'x-sync-token': token,
+			},
+			body: JSON.stringify(r.value),
+		});
+		const payload = await res.json().catch(() => ({}));
+		if (!res.ok || payload?.success !== true) {
+			throw new Error(payload?.message || 'เพิ่มรายการไม่สำเร็จ');
+		}
+
+		await refreshDashboard({ silent: true });
+		Swal.fire({
+			icon: 'success',
+			title: 'เพิ่มรายการแล้ว',
+			text: (payload?.item?.displayName || '').toString(),
+		});
+	} catch (e) {
+		console.error(e);
+		try {
+			Swal.fire({
+				icon: 'error',
+				title: 'เพิ่มรายการไม่สำเร็จ',
+				text: e?.message || 'เกิดข้อผิดพลาด',
+			});
+		} catch {}
+	}
+}
+
+async function deleteItemFromDashboard() {
+	try {
+		ensureSwal();
+		const token = await ensureAdminToken();
+		if (!token) return;
+
+		if (!Array.isArray(items) || items.length === 0) {
+			await refreshDashboard({ silent: true });
+		}
+
+		const opts = {};
+		(items || [])
+			.slice()
+			.sort((a, b) => (a?.displayName || '').toString().localeCompare((b?.displayName || '').toString(), 'th', { sensitivity: 'base' }))
+			.forEach((it) => {
+				const name = (it?.displayName || '').toString();
+				if (!name) return;
+				opts[name] = name;
+			});
+
+		const pick = await Swal.fire({
+			title: 'เลือกรายการที่จะลบ',
+			text: 'ระบบจะลบทั้งใน Cloud และในชีต AllstockV2',
+			input: 'select',
+			inputOptions: opts,
+			inputPlaceholder: 'เลือกรายการ',
+			showCancelButton: true,
+			confirmButtonText: 'ถัดไป',
+			cancelButtonText: 'ยกเลิก',
+			inputValidator: (v) => (!v ? 'กรุณาเลือกรายการ' : undefined),
+		});
+		if (!pick.isConfirmed) return;
+		const displayName = (pick.value || '').toString();
+		if (!displayName) return;
+
+		const code = generateConfirmCode5Digits_();
+		const confirm = await Swal.fire({
+			title: 'ยืนยันการลบ (Hard delete)',
+			html: `
+			<div class="text-start">
+				<div>รายการ: <b>${escapeHtml(displayName)}</b></div>
+				<div class="mt-2">พิมพ์โค้ดนี้เพื่อยืนยัน: <b style="font-size:1.25rem;">${code}</b></div>
+			</div>
+			`,
+			input: 'text',
+			inputPlaceholder: 'พิมพ์โค้ด 5 หลัก',
+			showCancelButton: true,
+			confirmButtonText: 'ลบถาวร',
+			cancelButtonText: 'ยกเลิก',
+			preConfirm: (v) => {
+				const typed = (v || '').toString().trim();
+				if (typed !== code) {
+					Swal.showValidationMessage('โค้ดยืนยันไม่ตรง');
+					return;
+				}
+				return true;
+			},
+		});
+		if (!confirm.isConfirmed) return;
+
+		Swal.fire({
+			title: 'กำลังลบ...',
+			allowOutsideClick: false,
+			allowEscapeKey: false,
+			didOpen: () => Swal.showLoading(),
+		});
+
+		const res = await fetch('/api/deleteItem', {
+			method: 'POST',
+			headers: {
+				'Content-Type': 'application/json',
+				'x-sync-token': token,
+			},
+			body: JSON.stringify({ displayName }),
+		});
+		const payload = await res.json().catch(() => ({}));
+		if (!res.ok || payload?.success !== true) {
+			throw new Error(payload?.message || 'ลบรายการไม่สำเร็จ');
+		}
+
+		await refreshDashboard({ silent: true });
+		Swal.fire({
+			icon: 'success',
+			title: 'ลบแล้ว',
+			text: displayName,
+		});
+	} catch (e) {
+		console.error(e);
+		try {
+			Swal.fire({
+				icon: 'error',
+				title: 'ลบรายการไม่สำเร็จ',
+				text: e?.message || 'เกิดข้อผิดพลาด',
+			});
+		} catch {}
+	}
+}
+
 function normalizeKey(raw) {
 	return (raw || '').toString().trim().replace(/\s+/g, ' ').toLowerCase();
+}
+
+function getStockStatus_(remainingQty, lowStockThreshold) {
+	const stock = Number(remainingQty);
+	const threshold = Number(lowStockThreshold);
+	const lowCutoff = Number.isFinite(threshold) ? threshold : 5;
+
+	if (!Number.isFinite(stock)) {
+		return { key: 'unknown', rank: 3, lowCutoff };
+	}
+	if (stock === 0) {
+		return { key: 'out', rank: 0, lowCutoff };
+	}
+	if (stock <= lowCutoff) {
+		return { key: 'low', rank: 1, lowCutoff };
+	}
+	return { key: 'ok', rank: 2, lowCutoff };
 }
 
 function statusBadge(remainingQty, lowStockThreshold) {
@@ -266,7 +483,7 @@ function formatDateTime(isoString) {
 
 async function fetchItemsDetail() {
 	try {
-		const res = await fetch('/api/items?detail=1&limit=300', { method: 'GET' });
+		const res = await fetch('/api/items?detail=1&limit=500', { method: 'GET' });
 		const payload = await res.json();
 		if (!res.ok || payload?.success !== true) return [];
 		return Array.isArray(payload.items) ? payload.items : [];
@@ -321,18 +538,22 @@ function renderTable(list) {
 	const rows = Array.isArray(list) ? list : [];
 	rows
 		.slice()
-		.sort((a, b) => (a?.displayName || '').toString().localeCompare((b?.displayName || '').toString(), 'th', { sensitivity: 'base' }))
+		.sort((a, b) => {
+			const ar = getStockStatus_(a?.remainingQty, a?.lowStockThreshold).rank;
+			const br = getStockStatus_(b?.remainingQty, b?.lowStockThreshold).rank;
+			if (ar !== br) return ar - br;
+			return (a?.displayName || '').toString().localeCompare((b?.displayName || '').toString(), 'th', { sensitivity: 'base' });
+		})
 		.forEach((it) => {
 			const name = (it?.displayName || '').toString();
 			const remainingQty = it?.remainingQty;
 			const unit = (it?.unit || '').toString();
 			const lowStockThreshold = it?.lowStockThreshold;
-			const stockNum = Number(remainingQty);
+			const status = getStockStatus_(remainingQty, lowStockThreshold);
 
 			const tr = document.createElement('tr');
-			if (Number.isFinite(stockNum) && stockNum === 0) {
-				tr.classList.add('row-out');
-			}
+			if (status.key === 'out') tr.classList.add('table-danger');
+			if (status.key === 'low') tr.classList.add('table-warning');
 
 			const tdName = document.createElement('td');
 			tdName.textContent = name;
@@ -377,6 +598,33 @@ function renderTable(list) {
 			tr.appendChild(tdAdd);
 			tbody.appendChild(tr);
 		});
+}
+
+function renderStockAlertsBanner(list) {
+	const banner = document.getElementById('stockAlertsBanner');
+	if (!banner) return;
+
+	const rows = Array.isArray(list) ? list : [];
+	const out = rows
+		.filter((it) => getStockStatus_(it?.remainingQty, it?.lowStockThreshold).key === 'out')
+		.map((it) => (it?.displayName || '').toString().trim())
+		.filter((n) => n !== '')
+		.sort((a, b) => a.localeCompare(b, 'th', { sensitivity: 'base' }));
+
+	if (out.length === 0) {
+		banner.classList.add('d-none');
+		banner.innerHTML = '';
+		return;
+	}
+
+	const maxShow = 8;
+	const shown = out.slice(0, maxShow);
+	const more = out.length - shown.length;
+	const listText = shown.map((n) => escapeHtml(n)).join(', ');
+	const moreText = more > 0 ? ` และอีก ${escapeHtml(String(more))} รายการ` : '';
+
+	banner.innerHTML = `<div><strong>แจ้งเตือน:</strong> มี <strong>${escapeHtml(String(out.length))}</strong> รายการหมดสต็อก</div><div class="small mt-1">${listText}${moreText}</div>`;
+	banner.classList.remove('d-none');
 }
 
 function renderKpis(list) {
@@ -480,6 +728,122 @@ function formatTimeOnly(isoString) {
 	}
 }
 
+function formatWithdrawalPreview_(entries, maxItems = 4) {
+	const list = Array.isArray(entries) ? entries : [];
+	const picked = list.slice(0, Math.max(0, maxItems));
+	const text = picked.map((it) => {
+		const itemName = (it?.item || '-').toString();
+		const qty = Number(it?.quantity);
+		const qtyText = Number.isFinite(qty) ? qty : (it?.quantity ?? '-');
+		const unit = (it?.unit || '').toString();
+		return `${itemName} ${qtyText}${unit ? ` ${unit}` : ''}`;
+	}).join(', ');
+	const more = Math.max(0, list.length - picked.length);
+	return { text, more };
+}
+
+async function showWithdrawalDetails(withdrawalIdEnc) {
+	try {
+		ensureSwal();
+		const wid = decodeURIComponent((withdrawalIdEnc || '').toString());
+		const w = (recentWithdrawals || []).find((x) => (x?.id || '') === wid) || null;
+		if (!w) {
+			Swal.fire({ icon: 'info', title: 'ไม่พบข้อมูล', text: 'กรุณากดอัปเดตข้อมูลอีกครั้ง' });
+			return;
+		}
+		const name = (w?.name || '').toString();
+		const timeText = formatTimeOnly(w?.createdAt) || '--:--';
+		const entries = Array.isArray(w?.items) ? w.items : [];
+		const lines = entries.length
+			? entries.map((it) => {
+				const itemName = escapeHtml((it?.item || '-').toString());
+				const qty = Number(it?.quantity);
+				const qtyText = escapeHtml((Number.isFinite(qty) ? qty : (it?.quantity ?? '-')).toString());
+				const unit = escapeHtml((it?.unit || '').toString());
+				return `• ${itemName} <b>${qtyText}</b>${unit ? ` ${unit}` : ''}`;
+			}).join('<br>')
+			: '<div class="text-muted">ไม่พบรายละเอียดรายการ</div>';
+
+		Swal.fire({
+			title: 'รายละเอียดการเบิก',
+			html: `<div class="text-start"><div><b>${escapeHtml(timeText)}</b> — ${escapeHtml(name || '-')}</div><div class="mt-2">${lines}</div></div>`,
+			confirmButtonText: 'ปิด',
+		});
+	} catch (e) {
+		console.error(e);
+		try { Swal.fire({ icon: 'error', title: 'เปิดรายละเอียดไม่สำเร็จ', text: e?.message || 'เกิดข้อผิดพลาด' }); } catch {}
+	}
+}
+
+async function deleteWithdrawalFromHistory(withdrawalIdEnc) {
+	try {
+		ensureSwal();
+		const token = await ensureAdminToken();
+		if (!token) return;
+
+		const wid = decodeURIComponent((withdrawalIdEnc || '').toString());
+		const w = (recentWithdrawals || []).find((x) => (x?.id || '') === wid) || null;
+		if (!w) {
+			Swal.fire({ icon: 'info', title: 'ไม่พบข้อมูล', text: 'กรุณากดอัปเดตข้อมูลอีกครั้ง' });
+			return;
+		}
+
+		const code = generateConfirmCode5Digits_();
+		const timeText = formatTimeOnly(w?.createdAt) || '--:--';
+		const name = (w?.name || '').toString();
+		const preview = formatWithdrawalPreview_(w?.items, 6);
+
+		const confirm = await Swal.fire({
+			title: 'ลบชุดการเบิก (Hard delete)',
+			html: `<div class="text-start">` +
+				`<div><b>${escapeHtml(timeText)}</b> — ${escapeHtml(name || '-')}</div>` +
+				`<div class="mt-1">${escapeHtml(preview.text || '')}${preview.more > 0 ? ` (+อีก ${preview.more} รายการ)` : ''}</div>` +
+				`<div class="mt-2">พิมพ์โค้ดนี้เพื่อยืนยัน: <b style="font-size:1.25rem;">${code}</b></div>` +
+			`</div>`,
+			input: 'text',
+			inputPlaceholder: 'พิมพ์โค้ด 5 หลัก',
+			showCancelButton: true,
+			confirmButtonText: 'ลบถาวร',
+			cancelButtonText: 'ยกเลิก',
+			preConfirm: (v) => {
+				const typed = (v || '').toString().trim();
+				if (typed !== code) {
+					Swal.showValidationMessage('โค้ดยืนยันไม่ตรง');
+					return;
+				}
+				return true;
+			},
+		});
+		if (!confirm.isConfirmed) return;
+
+		Swal.fire({
+			title: 'กำลังลบ...',
+			allowOutsideClick: false,
+			allowEscapeKey: false,
+			didOpen: () => Swal.showLoading(),
+		});
+
+		const res = await fetch('/api/deleteWithdrawal', {
+			method: 'POST',
+			headers: {
+				'Content-Type': 'application/json',
+				'x-sync-token': token,
+			},
+			body: JSON.stringify({ withdrawalId: wid }),
+		});
+		const payload = await res.json().catch(() => ({}));
+		if (!res.ok || payload?.success !== true) {
+			throw new Error(payload?.message || 'ลบรายการเบิกไม่สำเร็จ');
+		}
+
+		await refreshDashboard({ silent: true });
+		Swal.fire({ icon: 'success', title: 'ลบแล้ว', timer: 1200, showConfirmButton: false });
+	} catch (e) {
+		console.error(e);
+		try { Swal.fire({ icon: 'error', title: 'ลบไม่สำเร็จ', text: e?.message || 'เกิดข้อผิดพลาด' }); } catch {}
+	}
+}
+
 function formatSheetTimestamp(value) {
 	if (value == null) return '';
 	if (typeof value === 'number' && Number.isFinite(value)) {
@@ -508,6 +872,7 @@ function renderHistory(withdrawals) {
 	if (!box) return;
 
 	const list = Array.isArray(withdrawals) ? withdrawals : [];
+	recentWithdrawals = list.slice();
 	const todayKey = getBkkDateKey();
 	const todayList = list.filter((w) => getBkkDateKey(w?.createdAt) === todayKey);
 
@@ -518,19 +883,27 @@ function renderHistory(withdrawals) {
 
 	const rows = todayList.slice(0, 30).map((w) => {
 		const timeText = formatTimeOnly(w?.createdAt) || '--:--';
+		const name = escapeHtml((w?.name || '-').toString());
 		const entries = Array.isArray(w?.items) ? w.items : [];
-		const itemPreview = entries.length > 0
-			? entries.slice(0, 3).map((it) => {
-				const itemName = escapeHtml(it?.item || '-');
-				const qty = Number(it?.quantity);
-				const qtyText = Number.isFinite(qty) ? qty : '-';
-				const unit = escapeHtml(it?.unit || '');
-				return `${itemName} ${qtyText}${unit ? ` ${unit}` : ''}`;
-			}).join(', ')
-			: 'ไม่พบรายละเอียดรายการ';
-		const moreCount = Math.max(0, entries.length - 3);
-		const moreText = moreCount > 0 ? ` (+อีก ${moreCount} รายการ)` : '';
-		return `<div class="history-row">• <strong>${timeText}</strong> ${itemPreview}${moreText}</div>`;
+		const preview = formatWithdrawalPreview_(entries, 4);
+		const widEnc = encodeURIComponent((w?.id || '').toString());
+		const previewText = entries.length > 0 ? escapeHtml(preview.text || '') : 'ไม่พบรายละเอียดรายการ';
+		const moreText = preview.more > 0 ? ` (+อีก ${preview.more} รายการ)` : '';
+
+		const viewBtn = entries.length > 0
+			? `<button type="button" class="btn btn-sm btn-outline-secondary" title="ดูรายละเอียด" onclick="showWithdrawalDetails('${widEnc}')"><i class="bi bi-eye"></i></button>`
+			: '';
+		const delBtn = `<button type="button" class="btn btn-sm btn-outline-danger" title="ลบทั้งชุด" onclick="deleteWithdrawalFromHistory('${widEnc}')"><i class="bi bi-trash"></i></button>`;
+
+		return `
+			<div class="history-row d-flex align-items-start justify-content-between gap-2">
+				<div class="flex-grow-1">
+					<div>• <strong>${escapeHtml(timeText)}</strong> — ${name}</div>
+					<div class="text-muted">${previewText}${moreText}</div>
+				</div>
+				<div class="d-flex gap-1">${viewBtn}${delBtn}</div>
+			</div>
+		`;
 	});
 
 	box.innerHTML = rows.join('');
@@ -544,7 +917,9 @@ function applySearch(query) {
 		filteredItems = items.filter((it) => normalizeKey(it?.displayName).includes(q));
 	}
 
-	renderKpis(filteredItems);
+	// KPIs should reflect the full inventory (Firestore source of truth),
+	// not the current filtered/search view.
+	renderKpis(items);
 	renderTable(filteredItems);
 }
 
@@ -768,6 +1143,8 @@ async function refreshDashboard({ silent = false } = {}) {
 				lowStockThreshold: it?.lowStockThreshold ?? null,
 			})).filter((it) => it.displayName.trim() !== '');
 
+			renderStockAlertsBanner(items);
+
 			renderChart(top);
 			renderHistory(recent);
 			applySearch(currentQuery);
@@ -804,6 +1181,10 @@ window.refreshDashboard = refreshDashboard;
 window.addStockForItem = addStockForItem;
 window.removeStockForItem = removeStockForItem;
 window.sendMonthlyReportTest = sendMonthlyReportTest;
+window.createItemFromDashboard = createItemFromDashboard;
+window.deleteItemFromDashboard = deleteItemFromDashboard;
+window.showWithdrawalDetails = showWithdrawalDetails;
+window.deleteWithdrawalFromHistory = deleteWithdrawalFromHistory;
 
 document.addEventListener('DOMContentLoaded', init);
 
