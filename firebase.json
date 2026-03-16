@@ -68,6 +68,10 @@
         "function": "createItem"
       },
       {
+        "source": "/api/reconcileInventory",
+        "function": "reconcileInventory"
+      },
+      {
         "source": "/api/deleteItem",
         "function": "deleteItem"
       },

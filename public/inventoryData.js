@@ -21,6 +21,176 @@ const lookupCache = {
 
 let combinedLookupsPromise = null;
 
+const FILTER_CARTRIDGE_TIPS = [
+  {
+    id: '3m-6001',
+    productName: 'ตลับกรอง 3M 6001 (แถบดำ)',
+    shortSummary: 'เหมาะกับงานที่มีไอระเหยสารอินทรีย์ และต้องใช้กับหน้ากาก 3M แบบ bayonet ที่รองรับ',
+    highlights: [
+      'ใช้กับตลับกรองไอระเหยสารอินทรีย์ เช่น งานพ่นสี ตัวทำละลาย และงานเคลือบผิว',
+      'ตัวตลับเป็นแบบ bayonet หมุนล็อก 1/4 รอบ ใช้ร่วมกับหน้ากาก 3M ซีรีส์ 6000, 6500, 7500 และ full face ที่รองรับ',
+      'ทรง low-profile ช่วยให้มุมมองและสมดุลการสวมใส่ดีขึ้น',
+    ],
+    caution: 'ควรเปลี่ยนตาม change-out schedule ของหน้างาน หรือเปลี่ยนทันทีเมื่อเริ่มได้กลิ่น ระคายเคือง หรือหายใจไม่สะดวก',
+    references: ['3M Organic Vapor Cartridge 6001 product page'],
+    matchers: ['ตลับกรอง 3m 6001', '3m 6001', '6001 แถบดำ', '6001'],
+  },
+  {
+    id: '3m-6003',
+    productName: 'ตลับกรอง 3M 6003 (แถบเหลือง)',
+    shortSummary: 'เหมาะกับงานที่มีทั้งไอระเหยสารอินทรีย์และก๊าซกรด เช่น คลอรีน ไฮโดรเจนคลอไรด์ หรือซัลเฟอร์ไดออกไซด์ ตามเงื่อนไขที่อุปกรณ์รองรับ',
+    highlights: [
+      'ใช้เมื่อหน้างานมี organic vapor และ acid gas อยู่ร่วมกัน',
+      'ต่อเข้ากับหน้ากาก 3M แบบ bayonet ได้รวดเร็วและใช้ได้กับหน้ากาก reusable หลายซีรีส์ของ 3M',
+      'เหมาะกับการลดจำนวนชนิดตลับที่ต้องสต็อกเมื่อหน้างานมี hazard ผสม',
+    ],
+    caution: 'ยังต้องอ้างอิงการประเมินอันตรายจริงของหน้างาน และเปลี่ยนตาม schedule หรือเมื่อเริ่มได้กลิ่น/ระคายเคือง',
+    references: ['3M 6000 series cartridge selection guidance'],
+    matchers: ['ตลับกรอง 3m 6003', '3m 6003', '6003 แถบเหลือง', '6003'],
+  },
+  {
+    id: '3m-6006',
+    productName: 'ตลับกรอง 3M 6006 (แถบเขียวมะกอก)',
+    shortSummary: 'ใช้กับงานที่มีหลายชนิดของก๊าซและไอระเหยรวมกัน เหมาะกับงานที่ hazard กว้างกว่ารุ่นเฉพาะทาง',
+    highlights: [
+      'กลุ่ม multi gas/vapor ใช้กับสารปนเปื้อนหลายประเภทในตลับเดียว',
+      'ระบบ bayonet ติดตั้งไว ใช้กับหน้ากาก reusable 3M ที่รองรับได้หลายรุ่น',
+      'ดีเมื่อหน้างานมีสารหลายกลุ่มและต้องการลดการสลับตลับบ่อย',
+    ],
+    caution: 'ควรใช้หลังยืนยันชนิดสารปนเปื้อนจริงแล้วเท่านั้น และต้องเปลี่ยนตาม change-out schedule ที่กำหนด',
+    references: ['3M multi gas/vapor cartridge selection guidance'],
+    matchers: ['ตลับกรอง 3m 6006', '3m 6006', '6006 แถบเขียว', '6006 แถบเขียวมะกอก', '6006'],
+  },
+  {
+    id: '3m-pink-particulate',
+    productName: 'ตลับกรองฝุ่นสีชมพู',
+    shortSummary: 'ใช้กรองฝุ่น ละออง และอนุภาคแขวนลอย โดยกลุ่ม 3M สีชมพูที่พบทั่วไปมักเป็น P100 particulate filter',
+    highlights: [
+      'เหมาะกับงานฝุ่น ละออง ฟูม และอนุภาคน้ำมัน/ไม่มีน้ำมันตามรุ่นที่รับรอง',
+      'รุ่น bayonet particulate filter เช่น 2091 ใช้ร่วมกับหน้ากาก 3M reusable ที่รองรับได้หลายซีรีส์',
+      'ควรเปลี่ยนเมื่อแผ่นกรองสกปรก เสียหาย หรือเริ่มหายใจฝืด',
+    ],
+    caution: 'ถ้าหน้างานมีไอระเหยหรือก๊าซร่วมด้วย ควรใช้ชนิดที่ป้องกัน gas/vapor ได้ ไม่ใช่ใช้เฉพาะกรองฝุ่นอย่างเดียว',
+    references: ['3M Particulate Filter 2091 product page'],
+    matchers: ['ตลับกรองฝุ่นสีชมพู', 'ไส้กรองฝุ่นสีชมพู', '3m 2091', '2091', 'ตลับกรองสีชมพู'],
+  },
+];
+
+const filterTipLookup = new Map();
+let activeFilterTip = null;
+let lastDismissedFilterTipKey = '';
+
+function preloadFilterTips() {
+  filterTipLookup.clear();
+  for (const tip of FILTER_CARTRIDGE_TIPS) {
+    const names = [tip.productName, ...(Array.isArray(tip.matchers) ? tip.matchers : [])];
+    for (const name of names) {
+      const key = normalizeLookupKey(name);
+      if (!key) continue;
+      filterTipLookup.set(key, tip);
+    }
+  }
+}
+
+function findFilterTipForItem(rawItemName) {
+  const key = normalizeLookupKey(rawItemName);
+  if (!key) return null;
+  if (filterTipLookup.has(key)) return filterTipLookup.get(key) || null;
+
+  for (const tip of FILTER_CARTRIDGE_TIPS) {
+    const names = [tip.productName, ...(Array.isArray(tip.matchers) ? tip.matchers : [])];
+    if (names.some((name) => key.includes(normalizeLookupKey(name)))) {
+      return tip;
+    }
+  }
+  return null;
+}
+
+function getFilterTipEls() {
+  return {
+    toast: document.getElementById('filterTipToast'),
+    title: document.getElementById('filterTipTitle'),
+    product: document.getElementById('filterTipProduct'),
+    summary: document.getElementById('filterTipSummary'),
+    openBtn: document.getElementById('filterTipOpen'),
+    closeBtn: document.getElementById('filterTipClose'),
+  };
+}
+
+function hideFilterTipToast({ remember = false } = {}) {
+  const { toast } = getFilterTipEls();
+  if (!toast) return;
+  if (remember && activeFilterTip?.id) {
+    lastDismissedFilterTipKey = activeFilterTip.id;
+  }
+  toast.hidden = true;
+  toast.classList.remove('is-visible');
+}
+
+function openFilterTipDetails() {
+  const tip = activeFilterTip;
+  if (!tip) return;
+  ensureSwal();
+  const bulletsHtml = (tip.highlights || []).map((line) => `<li>${line}</li>`).join('');
+  const refsHtml = (tip.references || []).map((ref) => `<li>${ref}</li>`).join('');
+  Swal.fire({
+    title: tip.productName,
+    html: `<div class="text-start">` +
+      `<div class="mb-2">${tip.shortSummary}</div>` +
+      `<div><b>แนวทางเลือกใช้</b></div>` +
+      `<ul>${bulletsHtml}</ul>` +
+      `<div class="mt-2"><b>ข้อควรระวัง</b></div>` +
+      `<div>${tip.caution}</div>` +
+      `<div class="mt-3 small text-muted"><b>อ้างอิง</b><ul>${refsHtml}</ul></div>` +
+      `</div>`,
+    confirmButtonText: 'ปิด',
+    confirmButtonColor: '#667eea',
+    width: 720,
+  });
+}
+
+function showFilterTipToast(tip) {
+  const { toast, title, product, summary } = getFilterTipEls();
+  if (!toast || !title || !product || !summary || !tip) return;
+  activeFilterTip = tip;
+  title.textContent = 'คำแนะนำการเลือกตลับกรอง';
+  product.textContent = tip.productName;
+  summary.textContent = tip.shortSummary;
+  toast.hidden = false;
+  requestAnimationFrame(() => {
+    toast.classList.add('is-visible');
+  });
+}
+
+function syncFilterTipFromCurrentItem({ force = false } = {}) {
+  const input = document.getElementById('inputItem');
+  if (!input) return;
+  const tip = findFilterTipForItem(input.value);
+  if (!tip) {
+    activeFilterTip = null;
+    lastDismissedFilterTipKey = '';
+    hideFilterTipToast();
+    return;
+  }
+  if (!force && lastDismissedFilterTipKey === tip.id) return;
+  if (activeFilterTip?.id === tip.id && !force) return;
+  showFilterTipToast(tip);
+}
+
+function wireFilterTipInteractions() {
+  const { openBtn, closeBtn } = getFilterTipEls();
+  if (openBtn) {
+    openBtn.addEventListener('click', () => {
+      openFilterTipDetails();
+    });
+  }
+  if (closeBtn) {
+    closeBtn.addEventListener('click', () => {
+      hideFilterTipToast({ remember: true });
+    });
+  }
+}
+
 function normalizeUnitValue(raw) {
   return (raw ?? '')
     .toString()
@@ -326,6 +496,7 @@ function editAddedItem(index) {
   updateAddedItemsWidget();
 
   // Focus the item input for quick edits.
+  syncFilterTipFromCurrentItem({ force: true });
   if (inputItem) inputItem.focus();
 }
 
@@ -699,6 +870,8 @@ function setItemPopupItems(items, { emptyText } = {}) {
       btn.addEventListener('click', () => {
         input.value = row.displayName;
         hideItemPopup();
+        lastDismissedFilterTipKey = '';
+        syncFilterTipFromCurrentItem({ force: true });
         input.focus();
       });
     }
@@ -779,6 +952,8 @@ function wireItemAutocomplete() {
   });
 
   input.addEventListener('input', () => {
+    lastDismissedFilterTipKey = '';
+    syncFilterTipFromCurrentItem();
     const q = input.value;
     lastItemQuery = q;
     const prevMode = itemPopupMode;
@@ -820,6 +995,7 @@ function wireItemAutocomplete() {
   });
 
   input.addEventListener('focus', () => {
+    syncFilterTipFromCurrentItem();
     // Do not auto-open popup; only open on typing or dropdown button.
     if (itemPopupMode === 'search' && (input.value || '').trim() !== '') {
       // If user returns focus, show current suggestions quickly.
@@ -1153,8 +1329,10 @@ async function submitForm() {
 document.addEventListener('DOMContentLoaded', () => {
   try {
     ensureSwal();
+    preloadFilterTips();
     wireNameAutocomplete();
     wireItemAutocomplete();
+    wireFilterTipInteractions();
 
     // Preload lookups early so dropdown/search is instant when user interacts.
     // Use a tiny delay to avoid blocking first paint.
@@ -1172,6 +1350,7 @@ document.addEventListener('DOMContentLoaded', () => {
       });
     }
     updateAddedItemsWidget();
+    syncFilterTipFromCurrentItem({ force: true });
 
     Swal.fire({
       toast: true,

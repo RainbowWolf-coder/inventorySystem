@@ -1579,6 +1579,168 @@ async function getSheetsClient_(settings, { readOnly = false } = {}) {
   return google.sheets({ version: 'v4', auth });
 }
 
+function normalizeSheetCellText_(value) {
+  return (value ?? '').toString().trim().replace(/\s+/g, ' ');
+}
+
+function safeSheetNumber_(raw) {
+  if (raw === '' || raw == null) return null;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : null;
+}
+
+function looksLikeItemDocId_(value) {
+  const s = (value || '').toString().trim();
+  return /^[a-f0-9]{64}$/i.test(s);
+}
+
+async function fetchAllstockV2SheetSnapshot_(settings) {
+  const spreadsheetId = requireString(settings.spreadsheetId, 'SPREADSHEET_ID');
+  const sheets = await getSheetsClient_(settings, { readOnly: true });
+
+  const sheetName = 'AllstockV2';
+  const a1SheetName = `'${sheetName.replace(/'/g, "''")}'`;
+
+  const resp = await sheets.spreadsheets.values.get({
+    spreadsheetId,
+    range: `${a1SheetName}!A:M`,
+    majorDimension: 'ROWS',
+    valueRenderOption: 'UNFORMATTED_VALUE',
+  });
+
+  const rows = Array.isArray(resp?.data?.values) ? resp.data.values : [];
+  if (rows.length === 0) {
+    return {
+      itemsById: new Map(),
+      duplicateRows: [],
+      invalidRows: [],
+      meta: {
+        sheetName,
+        rowCount: 0,
+        headerRowIndex0: -1,
+        itemCol: 2,
+        remainingCol: 4,
+        unitCol: 5,
+        itemIdCol: 12,
+      },
+    };
+  }
+
+  let headerRowIndex0 = -1;
+  let itemCol = -1;
+  let remainingCol = -1;
+  let unitCol = -1;
+  let itemIdCol = -1;
+  let lowStockCol = -1;
+
+  for (let r = 0; r < Math.min(rows.length, 20); r++) {
+    const row = rows[r] || [];
+    const foundItem = row.findIndex((c) => normalizeSheetCellText_(c) === SHEET_HEADER_ITEM);
+    if (foundItem >= 0) {
+      headerRowIndex0 = r;
+      itemCol = foundItem;
+      remainingCol = row.findIndex((c) => normalizeSheetCellText_(c) === SHEET_HEADER_REMAINING);
+      unitCol = row.findIndex((c) => normalizeSheetCellText_(c) === SHEET_HEADER_UNIT);
+      lowStockCol = row.findIndex((c) => LOW_STOCK_THRESHOLD_HEADERS.includes(normalizeSheetCellText_(c)));
+      itemIdCol = row.findIndex((c) => {
+        const h = normalizeSheetCellText_(c).toLowerCase();
+        return h === 'itemid' || h === 'id' || h === 'docid' || h === 'รหัส' || h === 'รหัสสินค้า';
+      });
+      break;
+    }
+  }
+
+  if (itemCol < 0) itemCol = 2;
+  if (remainingCol < 0) remainingCol = 4;
+  if (unitCol < 0) unitCol = 5;
+  if (lowStockCol < 0) lowStockCol = 10;
+  if (itemIdCol < 0) itemIdCol = 12;
+
+  const itemsById = new Map();
+  const duplicateRows = [];
+  const invalidRows = [];
+
+  for (let r = Math.max(0, headerRowIndex0 + 1); r < rows.length; r++) {
+    const row = rows[r] || [];
+    const displayName = normalizeSheetCellText_(row[itemCol]);
+    if (!displayName) continue;
+
+    const itemKey = normalizeItemKey(displayName);
+    if (!itemKey) {
+      invalidRows.push({ rowNumber: r + 1, displayName, reason: 'Invalid displayName' });
+      continue;
+    }
+
+    const rawRemainingQty = row[remainingCol];
+    const remainingQty = safeSheetNumber_(rawRemainingQty);
+    if (remainingQty == null) {
+      invalidRows.push({
+        rowNumber: r + 1,
+        displayName,
+        reason: 'Invalid remainingQty',
+        rawRemainingQty: rawRemainingQty ?? null,
+      });
+      continue;
+    }
+
+    const rawLowStockThreshold = row[lowStockCol];
+    const lowStockThreshold = safeSheetNumber_(rawLowStockThreshold);
+    if (rawLowStockThreshold !== '' && rawLowStockThreshold != null && lowStockThreshold == null) {
+      invalidRows.push({
+        rowNumber: r + 1,
+        displayName,
+        reason: 'Invalid lowStockThreshold',
+        rawLowStockThreshold,
+      });
+    }
+
+    const rawItemId = normalizeSheetCellText_(row[itemIdCol]);
+    const docId = looksLikeItemDocId_(rawItemId)
+      ? rawItemId.toLowerCase()
+      : itemDocIdFromKey(itemKey);
+
+    const entry = {
+      docId,
+      displayName,
+      searchKey: itemKey,
+      remainingQty,
+      unit: normalizeSheetCellText_(row[unitCol]) || null,
+      lowStockThreshold,
+      sheetRowNumber: r + 1,
+      hasExplicitItemId: looksLikeItemDocId_(rawItemId),
+    };
+
+    if (itemsById.has(docId)) {
+      const first = itemsById.get(docId);
+      duplicateRows.push({
+        docId,
+        displayName,
+        firstRowNumber: first?.sheetRowNumber ?? null,
+        duplicateRowNumber: r + 1,
+      });
+      continue;
+    }
+
+    itemsById.set(docId, entry);
+  }
+
+  return {
+    itemsById,
+    duplicateRows,
+    invalidRows,
+    meta: {
+      sheetName,
+      rowCount: rows.length,
+      headerRowIndex0,
+      itemCol,
+      remainingCol,
+      unitCol,
+        lowStockCol,
+      itemIdCol,
+    },
+  };
+}
+
 async function appendStockItemToAllstockSheet_(settings, {
   displayName,
   incomingQty,
@@ -3052,6 +3214,207 @@ exports.createItem = onRequest({
       res.status(500).json({
         success: false,
         message: error?.message || 'createItem failed',
+      });
+    }
+  });
+});
+
+// POST /api/reconcileInventory (sync item list + remainingQty from AllstockV2 sheet into Firestore)
+// Protected by SYNC_TOKEN via header x-sync-token
+exports.reconcileInventory = onRequest({
+  maxInstances: 1,
+  invoker: 'public',
+  secrets: [
+    SYNC_TOKEN_SECRET,
+    SPREADSHEET_ID_SECRET,
+    GOOGLE_CLIENT_EMAIL_SECRET,
+    GOOGLE_PRIVATE_KEY_SECRET,
+  ],
+}, async (req, res) => {
+  return cors(req, res, async () => {
+    try {
+      if (req.method === 'OPTIONS') {
+        res.status(204).send('');
+        return;
+      }
+
+      if (req.method !== 'POST') {
+        res.status(405).json({ success: false, message: 'Method Not Allowed' });
+        return;
+      }
+
+      if (!ensureSyncTokenAuthorized(req, res)) {
+        return;
+      }
+
+      const body = (typeof req.body === 'object' && req.body) ? req.body : {};
+      const dryRun = body?.dryRun === true || body?.dryRun === 'true' || body?.mode === 'dry-run';
+
+      if (isFunctionsEmulator() && !hasFirestoreEmulator()) {
+        res.status(400).json({ success: false, message: 'Firestore emulator is not running' });
+        return;
+      }
+
+      const settings = getRuntimeSettings();
+      const [sheetSnapshot, firestoreSnap] = await Promise.all([
+        fetchAllstockV2SheetSnapshot_(settings),
+        getDb().collection('stockItems').get(),
+      ]);
+
+      const firestoreItemsById = new Map();
+      for (const doc of firestoreSnap.docs) {
+        const data = doc.data() || {};
+        firestoreItemsById.set(doc.id, {
+          docId: doc.id,
+          displayName: normalizeSheetCellText_(data.displayName),
+          searchKey: normalizeItemKey(data.displayName || ''),
+          remainingQty: (typeof data.remainingQty === 'number' && Number.isFinite(data.remainingQty)) ? data.remainingQty : null,
+          unit: normalizeSheetCellText_(data.unit) || null,
+          lowStockThreshold: (typeof data.lowStockThreshold === 'number' && Number.isFinite(data.lowStockThreshold)) ? data.lowStockThreshold : null,
+        });
+      }
+
+      const createdItems = [];
+      const syncedItems = [];
+      const missingInSheet = [];
+      const writeErrors = [];
+
+      let batch = getDb().batch();
+      let batchOpCount = 0;
+      const commitBatch = async () => {
+        if (batchOpCount <= 0) return;
+        await batch.commit();
+        batch = getDb().batch();
+        batchOpCount = 0;
+      };
+      const queueSet = (ref, payload) => {
+        batch.set(ref, payload, { merge: true });
+        batchOpCount += 1;
+      };
+
+      const now = admin.firestore.FieldValue.serverTimestamp();
+
+      for (const sheetItem of sheetSnapshot.itemsById.values()) {
+        const ref = getDb().collection('stockItems').doc(sheetItem.docId);
+        const existing = firestoreItemsById.get(sheetItem.docId) || null;
+
+        const updatePayload = {
+          displayName: sheetItem.displayName,
+          searchKey: sheetItem.searchKey,
+          remainingQty: sheetItem.remainingQty,
+          unit: sheetItem.unit,
+          lowStockThreshold: sheetItem.lowStockThreshold,
+          updatedAt: now,
+          updatedSource: 'sheet-reconcile',
+        };
+
+        const displayNameChanged = !existing || existing.displayName !== sheetItem.displayName;
+        const remainingChanged = !existing || existing.remainingQty !== sheetItem.remainingQty;
+        const unitChanged = !existing || existing.unit !== sheetItem.unit;
+        const lowStockChanged = !existing || existing.lowStockThreshold !== sheetItem.lowStockThreshold;
+
+        if (!existing) {
+          updatePayload.createdAt = now;
+          updatePayload.createdSource = 'sheet-reconcile';
+          if (!dryRun) {
+            queueSet(ref, updatePayload);
+          }
+          createdItems.push({
+            docId: sheetItem.docId,
+            displayName: sheetItem.displayName,
+            remainingQty: sheetItem.remainingQty,
+            unit: sheetItem.unit,
+            lowStockThreshold: sheetItem.lowStockThreshold,
+            rowNumber: sheetItem.sheetRowNumber,
+          });
+        } else if (displayNameChanged || remainingChanged || unitChanged || lowStockChanged) {
+          if (!dryRun) {
+            queueSet(ref, updatePayload);
+          }
+          syncedItems.push({
+            docId: sheetItem.docId,
+            displayName: sheetItem.displayName,
+            rowNumber: sheetItem.sheetRowNumber,
+            previousRemainingQty: existing.remainingQty,
+            nextRemainingQty: sheetItem.remainingQty,
+            previousUnit: existing.unit,
+            nextUnit: sheetItem.unit,
+            previousLowStockThreshold: existing.lowStockThreshold,
+            nextLowStockThreshold: sheetItem.lowStockThreshold,
+            changes: {
+              displayName: displayNameChanged,
+              remainingQty: remainingChanged,
+              unit: unitChanged,
+              lowStockThreshold: lowStockChanged,
+            },
+          });
+        }
+
+        if (batchOpCount >= 400) {
+          await commitBatch();
+        }
+      }
+
+      for (const fsItem of firestoreItemsById.values()) {
+        if (!sheetSnapshot.itemsById.has(fsItem.docId)) {
+          missingInSheet.push({
+            docId: fsItem.docId,
+            displayName: fsItem.displayName,
+            remainingQty: fsItem.remainingQty,
+            unit: fsItem.unit,
+          });
+        }
+      }
+
+      try {
+        if (!dryRun) {
+          await commitBatch();
+        }
+      } catch (e) {
+        writeErrors.push({ message: e?.message || 'Batch commit failed' });
+        throw e;
+      }
+
+      if (!dryRun) {
+        clearCachedResponses(['items:']);
+      }
+
+      res.status(200).json({
+        success: true,
+        message: dryRun ? 'Reconcile inventory dry-run completed' : 'Reconcile inventory completed',
+        dryRun,
+        source: {
+          sheetName: sheetSnapshot.meta.sheetName,
+          itemColumn: 'C',
+          remainingQtyColumn: 'E',
+          remainingValueMode: 'UNFORMATTED_VALUE',
+          unitColumn: 'F',
+          lowStockThresholdColumn: sheetSnapshot.meta.lowStockCol >= 0
+            ? String.fromCharCode(65 + sheetSnapshot.meta.lowStockCol)
+            : 'K',
+        },
+        summary: {
+          dryRun,
+          firestoreItemsBefore: firestoreItemsById.size,
+          sheetItemsScanned: sheetSnapshot.itemsById.size,
+          createdCount: createdItems.length,
+          syncedCount: syncedItems.length,
+          missingInSheetCount: missingInSheet.length,
+          duplicateSheetRowsCount: sheetSnapshot.duplicateRows.length,
+          invalidSheetRowsCount: sheetSnapshot.invalidRows.length,
+          writeErrorCount: writeErrors.length,
+        },
+        createdItems,
+        syncedItems,
+        missingInSheet,
+        duplicateSheetRows: sheetSnapshot.duplicateRows,
+        invalidSheetRows: sheetSnapshot.invalidRows,
+      });
+    } catch (error) {
+      console.error('Error in reconcileInventory:', error);
+      res.status(500).json({
+        success: false,
+        message: error?.message || 'reconcileInventory failed',
       });
     }
   });

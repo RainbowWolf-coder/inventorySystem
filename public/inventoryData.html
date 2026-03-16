@@ -17,6 +17,23 @@
     
 </head>
 <body>
+    <aside id="filterTipToast" class="filter-tip-toast" aria-live="polite" aria-atomic="true" hidden>
+        <div class="filter-tip-toast__header">
+            <div>
+                <div class="filter-tip-toast__eyebrow">Filter Tips</div>
+                <div class="filter-tip-toast__title" id="filterTipTitle">คำแนะนำการเลือกตลับกรอง</div>
+            </div>
+            <button type="button" class="filter-tip-toast__close" id="filterTipClose" aria-label="ปิด">
+                <i class="bi bi-x-lg"></i>
+            </button>
+        </div>
+        <div class="filter-tip-toast__body">
+            <div class="filter-tip-toast__product" id="filterTipProduct"></div>
+            <div class="filter-tip-toast__summary" id="filterTipSummary"></div>
+            <button type="button" class="btn btn-sm filter-tip-toast__action" id="filterTipOpen">อ่านรายละเอียด</button>
+        </div>
+    </aside>
+
     <div class="main-container">
         <!-- Header -->
         <div class="header-section">
