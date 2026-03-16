@@ -57,14 +57,21 @@ function setAdminToken(token) {
 	} catch {}
 }
 
-async function ensureAdminToken() {
+function clearAdminToken() {
+	try {
+		sessionStorage.removeItem('SYNC_TOKEN');
+	} catch {}
+}
+
+
+async function ensureAdminToken({ forcePrompt = false, message } = {}) {
 	let token = getAdminToken();
-	if (token && token.trim() !== '') return token.trim();
+	if (!forcePrompt && token && token.trim() !== '') return token.trim();
 
 	ensureSwal();
 	const r = await Swal.fire({
 		title: 'ต้องใช้โทเค็นเพื่อปรับสต็อก',
-		text: 'ใส่ SYNC_TOKEN (ระบบจะจำไว้ชั่วคราวในหน้านี้)',
+		text: message || 'ใส่ SYNC_TOKEN (ระบบจะจำไว้ชั่วคราวในหน้านี้)',
 		input: 'password',
 		inputPlaceholder: 'SYNC_TOKEN',
 		showCancelButton: true,
@@ -76,6 +83,60 @@ async function ensureAdminToken() {
 	token = (r.value || '').toString().trim();
 	if (token) setAdminToken(token);
 	return token;
+}
+
+function isSyncTokenRejected(res, payload) {
+	if (res?.status === 403) return true;
+	return (payload?.message || '').toString().trim().toLowerCase() === 'forbidden';
+}
+
+async function fetchWithAdminToken(url, options = {}) {
+	ensureSwal();
+	let token = await ensureAdminToken();
+	if (!token) return { cancelled: true, res: null, payload: null };
+
+	for (let attempt = 0; attempt < 2; attempt += 1) {
+		const headers = {
+			...(options.headers || {}),
+			'x-sync-token': token,
+		};
+		const res = await fetch(url, {
+			...options,
+			headers,
+		});
+		const payload = await res.json().catch(() => ({}));
+
+		if (!isSyncTokenRejected(res, payload)) {
+			return { cancelled: false, authFailed: false, res, payload, token };
+		}
+
+		clearAdminToken();
+		if (attempt > 0) {
+			await Swal.fire({
+				icon: 'error',
+				title: 'SYNC_TOKEN ไม่ถูกต้อง',
+				text: 'กรุณาลองใหม่อีกครั้ง',
+			});
+			return { cancelled: false, authFailed: true, res, payload, token: '' };
+		}
+
+		await Swal.fire({
+			icon: 'warning',
+			title: 'SYNC_TOKEN ไม่ถูกต้อง',
+			text: 'ระบบจะให้กรอกโทเค็นใหม่',
+			confirmButtonText: 'ตกลง',
+		});
+
+		token = await ensureAdminToken({
+			forcePrompt: true,
+			message: 'SYNC_TOKEN เดิมไม่ถูกต้อง กรุณากรอกใหม่',
+		});
+		if (!token) {
+			return { cancelled: true, authFailed: true, res, payload, token: '' };
+		}
+	}
+
+	return { cancelled: false, authFailed: true, res: null, payload: null, token: '' };
 }
 
 async function addStockForItem(displayName) {
@@ -109,15 +170,14 @@ async function addStockForItem(displayName) {
 			didOpen: () => Swal.showLoading(),
 		});
 
-		const res = await fetch('/api/addStock', {
+		const { cancelled, authFailed, res, payload } = await fetchWithAdminToken('/api/addStock', {
 			method: 'POST',
 			headers: {
 				'Content-Type': 'application/json',
-				'x-sync-token': token,
 			},
 			body: JSON.stringify({ item: displayName, quantity }),
 		});
-		const payload = await res.json().catch(() => ({}));
+		if (cancelled || authFailed) return;
 		if (!res.ok || payload?.success !== true) {
 			throw new Error(payload?.message || 'เพิ่มสต็อกไม่สำเร็จ');
 		}
@@ -187,15 +247,14 @@ async function removeStockForItem(displayName) {
 			didOpen: () => Swal.showLoading(),
 		});
 
-		const res = await fetch('/api/removeStock', {
+		const { cancelled, authFailed, res, payload } = await fetchWithAdminToken('/api/removeStock', {
 			method: 'POST',
 			headers: {
 				'Content-Type': 'application/json',
-				'x-sync-token': token,
 			},
 			body: JSON.stringify({ item: displayName, quantity }),
 		});
-		const payload = await res.json().catch(() => ({}));
+		if (cancelled || authFailed) return;
 		if (!res.ok || payload?.success !== true) {
 			throw new Error(payload?.message || 'ลบจำนวนไม่สำเร็จ');
 		}
@@ -303,15 +362,14 @@ async function createItemFromDashboard() {
 			didOpen: () => Swal.showLoading(),
 		});
 
-		const res = await fetch('/api/createItem', {
+		const { cancelled, authFailed, res, payload } = await fetchWithAdminToken('/api/createItem', {
 			method: 'POST',
 			headers: {
 				'Content-Type': 'application/json',
-				'x-sync-token': token,
 			},
 			body: JSON.stringify(r.value),
 		});
-		const payload = await res.json().catch(() => ({}));
+		if (cancelled || authFailed) return;
 		if (!res.ok || payload?.success !== true) {
 			throw new Error(payload?.message || 'เพิ่มรายการไม่สำเร็จ');
 		}
@@ -401,15 +459,14 @@ async function deleteItemFromDashboard() {
 			didOpen: () => Swal.showLoading(),
 		});
 
-		const res = await fetch('/api/deleteItem', {
+		const { cancelled, authFailed, res, payload } = await fetchWithAdminToken('/api/deleteItem', {
 			method: 'POST',
 			headers: {
 				'Content-Type': 'application/json',
-				'x-sync-token': token,
 			},
 			body: JSON.stringify({ displayName }),
 		});
-		const payload = await res.json().catch(() => ({}));
+		if (cancelled || authFailed) return;
 		if (!res.ok || payload?.success !== true) {
 			throw new Error(payload?.message || 'ลบรายการไม่สำเร็จ');
 		}
@@ -511,6 +568,158 @@ async function fetchRecentWithdrawals() {
 		return Array.isArray(payload.withdrawals) ? payload.withdrawals : [];
 	} catch {
 		return [];
+	}
+}
+
+async function updateItemsFromDashboard() {
+	try {
+		ensureSwal();
+		const token = await ensureAdminToken();
+		if (!token) return;
+
+		const confirm = await Swal.fire({
+			icon: 'question',
+			title: 'อัปเดตรายการจาก Google Sheet',
+			html: '<div class="text-start">' +
+				'<div>ระบบจะทำ <b>Dry Run</b> ก่อน แล้วค่อยให้ยืนยันเขียนจริง</div>' +
+				'<div class="mt-2">เมื่อเขียนจริงจะยึดชีตเป็นหลักและ sync เข้า Cloud</div>' +
+				'<div class="mt-2">รายการ: <b>คอลัมน์ C</b></div>' +
+				'<div>คงเหลือ: <b>คอลัมน์ E</b> (อ่านค่าที่แสดงจากสูตร)</div>' +
+				'<div>หน่วย: <b>คอลัมน์ F</b></div>' +
+				'<div>ใกล้หมด: <b>คอลัมน์ที่หัวตารางเป็น ใกล้หมด/แจ้งเตือน/ขั้นต่ำ/ต่ำสุด</b></div>' +
+				'<div class="mt-2 text-muted small">ถ้ามีรายการใน Cloud แต่ไม่มีในชีต ระบบจะเตือนอย่างเดียวและไม่ลบ</div>' +
+			'</div>',
+			showCancelButton: true,
+			confirmButtonText: 'เริ่ม Dry Run',
+			cancelButtonText: 'ยกเลิก',
+		});
+		if (!confirm.isConfirmed) return;
+
+		Swal.fire({
+			title: 'กำลังทำ Dry Run...',
+			allowOutsideClick: false,
+			allowEscapeKey: false,
+			didOpen: () => Swal.showLoading(),
+		});
+
+		const { cancelled: dryRunCancelled, authFailed: dryRunAuthFailed, res: dryRunRes, payload: dryRunPayload } = await fetchWithAdminToken('/api/reconcileInventory', {
+			method: 'POST',
+			headers: {
+				'Content-Type': 'application/json',
+			},
+			body: JSON.stringify({
+				dryRun: true,
+				source: {
+					itemColumn: 'C',
+					remainingQtyColumn: 'E',
+					remainingValueMode: 'UNFORMATTED_VALUE',
+					unitColumn: 'F',
+				},
+			}),
+		});
+		if (dryRunCancelled || dryRunAuthFailed) return;
+		if (!dryRunRes.ok || dryRunPayload?.success !== true) {
+			throw new Error(dryRunPayload?.message || 'Dry Run ไม่สำเร็จ');
+		}
+
+		const buildCreatedPreview = (payload) => Array.isArray(payload?.createdItems)
+			? payload.createdItems.slice(0, 5).map((it) => `• ${(it?.displayName || '-').toString()} (${it?.remainingQty ?? '-'})`).join('<br>')
+			: '';
+		const buildSyncedPreview = (payload) => Array.isArray(payload?.syncedItems)
+			? payload.syncedItems.slice(0, 5).map((it) => {
+				const changes = [];
+				if (it?.changes?.remainingQty) changes.push(`${(it?.previousRemainingQty ?? '-').toString()} → ${(it?.nextRemainingQty ?? '-').toString()}`);
+				if (it?.changes?.unit) changes.push(`หน่วย: ${(it?.previousUnit ?? '-').toString()} → ${(it?.nextUnit ?? '-').toString()}`);
+				if (it?.changes?.lowStockThreshold) changes.push(`ใกล้หมด: ${(it?.previousLowStockThreshold ?? '-').toString()} → ${(it?.nextLowStockThreshold ?? '-').toString()}`);
+				return `• ${(it?.displayName || '-').toString()} : ${changes.join(' | ')}`;
+			}).join('<br>')
+			: '';
+		const buildMissingPreview = (payload) => Array.isArray(payload?.missingInSheet)
+			? payload.missingInSheet.slice(0, 5).map((it) => `• ${(it?.displayName || '-').toString()}`).join('<br>')
+			: '';
+
+		const buildSummaryHtml = (payload, titleText) => {
+			const summary = payload?.summary || {};
+			const createdPreview = buildCreatedPreview(payload);
+			const syncedPreview = buildSyncedPreview(payload);
+			const missingPreview = buildMissingPreview(payload);
+			let html = '<div class="text-start">' +
+				`<div><b>${titleText}</b></div>` +
+				`<div class="mt-2">เพิ่มรายการใหม่: <b>${summary.createdCount ?? 0}</b></div>` +
+				`<div>ปรับข้อมูลใน Cloud: <b>${summary.syncedCount ?? 0}</b></div>` +
+				`<div>เตือน: พบใน Cloud แต่ไม่มีในชีต <b>${summary.missingInSheetCount ?? 0}</b></div>` +
+				`<div>แถวซ้ำในชีต: <b>${summary.duplicateSheetRowsCount ?? 0}</b></div>` +
+				`<div>แถวข้อมูลไม่ถูกต้อง: <b>${summary.invalidSheetRowsCount ?? 0}</b></div>`;
+
+			if (createdPreview) {
+				html += `<div class="mt-3"><b>ตัวอย่างรายการใหม่</b><br>${createdPreview}</div>`;
+			}
+			if (syncedPreview) {
+				html += `<div class="mt-3"><b>ตัวอย่างรายการที่จะถูกปรับ</b><br>${syncedPreview}</div>`;
+			}
+			if (missingPreview) {
+				html += `<div class="mt-3"><b>รายการที่เตือน</b><br>${missingPreview}</div>`;
+			}
+			html += '</div>';
+			return html;
+		};
+
+		const applyConfirm = await Swal.fire({
+			icon: 'info',
+			title: 'ผล Dry Run',
+			html: buildSummaryHtml(dryRunPayload, 'ยังไม่ได้เขียนข้อมูลจริง'),
+			showCancelButton: true,
+			confirmButtonText: 'ยืนยันอัปเดตจริง',
+			cancelButtonText: 'ปิด',
+			width: 760,
+		});
+		if (!applyConfirm.isConfirmed) return;
+
+		Swal.fire({
+			title: 'กำลังอัปเดตจริง...',
+			allowOutsideClick: false,
+			allowEscapeKey: false,
+			didOpen: () => Swal.showLoading(),
+		});
+
+		const { cancelled: applyCancelled, authFailed: applyAuthFailed, res: applyRes, payload: applyPayload } = await fetchWithAdminToken('/api/reconcileInventory', {
+			method: 'POST',
+			headers: {
+				'Content-Type': 'application/json',
+			},
+			body: JSON.stringify({
+				dryRun: false,
+				source: {
+					itemColumn: 'C',
+					remainingQtyColumn: 'E',
+					remainingValueMode: 'UNFORMATTED_VALUE',
+					unitColumn: 'F',
+				},
+			}),
+		});
+		if (applyCancelled || applyAuthFailed) return;
+		if (!applyRes.ok || applyPayload?.success !== true) {
+			throw new Error(applyPayload?.message || 'อัปเดตรายการไม่สำเร็จ');
+		}
+
+		await refreshDashboard({ silent: true });
+
+		await Swal.fire({
+			icon: 'success',
+			title: 'อัปเดตรายการเสร็จแล้ว',
+			html: buildSummaryHtml(applyPayload, 'เขียนข้อมูลจริงเรียบร้อยแล้ว'),
+			confirmButtonText: 'ปิด',
+			width: 760,
+		});
+	} catch (e) {
+		console.error(e);
+		try {
+			Swal.fire({
+				icon: 'error',
+				title: 'อัปเดตรายการไม่สำเร็จ',
+				text: e?.message || 'เกิดข้อผิดพลาด',
+			});
+		} catch {}
 	}
 }
 
@@ -823,15 +1032,14 @@ async function deleteWithdrawalFromHistory(withdrawalIdEnc) {
 			didOpen: () => Swal.showLoading(),
 		});
 
-		const res = await fetch('/api/deleteWithdrawal', {
+		const { cancelled, authFailed, res, payload } = await fetchWithAdminToken('/api/deleteWithdrawal', {
 			method: 'POST',
 			headers: {
 				'Content-Type': 'application/json',
-				'x-sync-token': token,
 			},
 			body: JSON.stringify({ withdrawalId: wid }),
 		});
-		const payload = await res.json().catch(() => ({}));
+		if (cancelled || authFailed) return;
 		if (!res.ok || payload?.success !== true) {
 			throw new Error(payload?.message || 'ลบรายการเบิกไม่สำเร็จ');
 		}
@@ -936,13 +1144,10 @@ async function exportPDF() {
 			didOpen: () => Swal.showLoading(),
 		});
 
-		const resp = await fetch('/api/recieveForm?limit=500&reverse=1', {
+		const { cancelled, authFailed, res: resp, payload } = await fetchWithAdminToken('/api/recieveForm?limit=500&reverse=1', {
 			method: 'GET',
-			headers: {
-				'x-sync-token': token,
-			},
 		});
-		const payload = await resp.json().catch(() => ({}));
+		if (cancelled || authFailed) return;
 		if (!resp.ok || payload?.success !== true) {
 			throw new Error(payload?.message || 'ดึงข้อมูลจากชีตไม่สำเร็จ');
 		}
@@ -1051,15 +1256,14 @@ async function sendMonthlyReportTest() {
 			didOpen: () => Swal.showLoading(),
 		});
 
-		const res = await fetch('/api/sendMonthlyWithdrawalsReport', {
+		const { cancelled, authFailed, res, payload } = await fetchWithAdminToken('/api/sendMonthlyWithdrawalsReport', {
 			method: 'POST',
 			headers: {
 				'Content-Type': 'application/json',
-				'x-sync-token': token,
 			},
 			body: JSON.stringify({}),
 		});
-		const payload = await res.json().catch(() => ({}));
+		if (cancelled || authFailed) return;
 		if (!res.ok || payload?.success !== true) {
 			throw new Error(payload?.message || 'ส่งอีเมลไม่สำเร็จ');
 		}
@@ -1178,6 +1382,7 @@ async function refreshDashboard({ silent = false } = {}) {
 // Expose for inline onclick
 window.exportPDF = exportPDF;
 window.refreshDashboard = refreshDashboard;
+window.updateItemsFromDashboard = updateItemsFromDashboard;
 window.addStockForItem = addStockForItem;
 window.removeStockForItem = removeStockForItem;
 window.sendMonthlyReportTest = sendMonthlyReportTest;
